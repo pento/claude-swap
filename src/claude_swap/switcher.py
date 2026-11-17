@@ -803,8 +803,9 @@ class ClaudeAccountSwitcher:
         profile's possibly-stale plaintext seed — and rather than reaching the
         fallbacks below, which belong to other stores entirely.
 
-        Read-only. cswap does not write claude's hashed keychain entry — see
-        the ``session`` module docstring for why.
+        Read-only. cswap does not write claude's hashed OAuth keychain entry —
+        see the ``session`` module docstring for why (it writes only a session
+        profile's managed API-key item).
         """
         from claude_swap.session import read_config_dir_credentials
 
@@ -3240,6 +3241,7 @@ class ClaudeAccountSwitcher:
         an existing profile (e.g. --import --force).
         """
         from claude_swap.session import (
+            clear_profile_primary_api_key,
             clear_session_stale,
             delete_macos_keychain_entry,
         )
@@ -3249,6 +3251,7 @@ class ClaudeAccountSwitcher:
             return
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
+        clear_profile_primary_api_key(session_dir)
         clear_session_stale(session_dir)
         self._logger.info(
             f"Invalidated session credentials for account {account_num}"
@@ -3278,6 +3281,10 @@ class ClaudeAccountSwitcher:
         like ``session_identity_drifted`` it reads as "not drift" here, so
         the switch guard stays on its safe side; the adopting write, which
         needs positive evidence, checks the identity itself.
+
+        An API-key slot answers None too: its stored credential is a static
+        key, and an OAuth credential in its profile (an in-session /login)
+        is never a newer generation of it.
         """
         from claude_swap.session import (
             is_session_stale,
@@ -3285,6 +3292,8 @@ class ClaudeAccountSwitcher:
             session_identity_drifted,
         )
 
+        if self._account_kind(account_num) == "api_key":
+            return None
         session_dir = self._session_dir(account_num, email)
         if is_session_stale(session_dir):
             return None
@@ -7534,14 +7543,10 @@ class ClaudeAccountSwitcher:
         `remove_account` deleting the session profile of the very shell it
         was running in. Nine call sites is the honest cost of that.
         """
+        from claude_swap.session import is_session_profile
+
         cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        if not cfg_dir:
-            return
-        try:
-            Path(cfg_dir).resolve().relative_to(
-                (self.backup_dir / "sessions").resolve()
-            )
-        except ValueError:
+        if not cfg_dir or not is_session_profile(cfg_dir, self.backup_dir):
             return
         raise SwitchError(
             "This shell is inside a cswap run session profile "
@@ -7591,7 +7596,9 @@ class ClaudeAccountSwitcher:
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
-        if pre_email:
+        # An API-key slot has no rotating family to drift: its profile holds
+        # the same static key, so neither the refusal nor the warning applies.
+        if pre_email and self._account_kind(target_account) != "api_key":
             pre_org = pre_account.get("organizationUuid", "") or ""
             sessions, unreadable = scan_live_sessions(
                 self._session_dir(target_account, pre_email)

@@ -8,12 +8,44 @@ untouched. ``CLAUDE_CONFIG_DIR`` fully isolates Claude Code's config and
 credential lookup; on macOS, Claude hashes the (NFC-normalized) env var value
 into its keychain service name, so each profile gets its own keychain entry.
 
-Profiles are seeded with a plaintext ``.credentials.json`` — deliberate,
+OAuth profiles are seeded with a plaintext ``.credentials.json`` — deliberate,
 including on macOS: the plaintext fallback is Claude's only credential
 mechanism on Linux (a stable contract), and Claude migrates it into its
-hashed keychain entry on first write. Writing that keychain entry ourselves
-would couple us to Claude's internal storage format and naming, where a
-mismatch is a hard "logged out" failure instead of a harmless stale entry.
+hashed keychain entry on first write. Writing that OAuth keychain entry
+ourselves would couple us to Claude's internal storage format and naming,
+where a mismatch is a hard "logged out" failure instead of a harmless stale
+entry. cswap only reads and deletes that item.
+
+API-key accounts also get their own profile, always (a static key cannot
+drift, so there is no same-account shortcut to the default login). The key
+lives where Claude Code 2.1.326 looks for a managed key: on macOS only in the
+profile's ``Claude Code-<hash>`` keychain item, with ``primaryApiKey`` absent
+from the profile's ``.claude.json``; elsewhere as ``primaryApiKey`` in that
+file. Both also carry the slot's ``oauthAccount``, ``hasCompletedOnboarding``
+and the key's ``customApiKeyResponses.approved`` entry. Unlike the OAuth item,
+cswap writes the managed-key item itself, for three reasons: Claude migrates an
+OAuth seed into its keychain item on first write, but nothing in Claude Code
+2.1.326 migrates a key (read from its binary), so a seed would stay in plain
+text for good on macOS; the item is a bare
+key with no format to drift; and a wrong name fails the
+``claude auth status`` probe before launch rather than at the first prompt.
+When the macOS keychain refuses the item, setup raises and writes no key in
+plain text (Claude Code 2.1.326's own key save does not fall back either;
+read from its binary).
+
+Before every launch cswap checks that the key Claude would load is the stored
+key (:func:`profile_api_key_state`): on macOS the item must equal it and the
+config hold no ``primaryApiKey`` (which Claude reads when the item is missing,
+so a stray one could serve a different key); elsewhere ``primaryApiKey`` must
+equal it. A mismatch reseeds the profile. A re-key while a Claude is running
+in the profile updates the key in place and deletes nothing that Claude
+depends on; the running sessions keep their old key until they restart.
+Because a saved claude.ai login outranks the managed key in
+``claude auth status`` (Claude Code 2.1.326, measured on macOS 27.0), a seed
+with nothing live removes the profile's OAuth credential and item. Validation
+failures never delete an API-key profile, since the usual causes (an
+``apiKeyHelper`` setting, a provider override) are environmental and the
+directory holds the account's history.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
 ``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
@@ -51,6 +83,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -63,6 +96,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
+from claude_swap.credentials import approved_form, looks_like_api_key
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -264,6 +298,22 @@ AUTH_OVERRIDE_ENV_VARS = (
 # `claude auth status` is a local check (no API call) but spawns the full CLI.
 _AUTH_STATUS_TIMEOUT = 10.0
 
+# What `claude auth status --json` reports for a profile whose only login is a
+# managed API key. Claude Code 2.1.326, measured on macOS 27.0: ``authMethod``
+# is ``"api_key"`` and ``apiKeySource`` is ``"/login managed key"`` whether the
+# key sits in the profile's Keychain item or in ``primaryApiKey``. A saved
+# claude.ai login in the same profile outranks the key for ``authMethod``
+# (``"claude.ai"``) while ``apiKeySource`` still says ``"/login managed key"``.
+API_KEY_AUTH_METHOD = "api_key"
+MANAGED_KEY_SOURCE = "/login managed key"
+# Measured on the same build: an ``apiKeyHelper`` setting outranks the managed
+# key and reports ``authMethod: "api_key_helper"`` with
+# ``apiKeySource: "apiKeyHelper"``. Read from the 2.1.326 binary, not measured:
+# a third-party provider reports ``authMethod: "third_party"`` and makes the
+# managed-key lookup return nothing.
+_API_KEY_HELPER_SOURCE = "apiKeyHelper"
+_THIRD_PARTY_AUTH_METHOD = "third_party"
+
 # Bootstrap holds the backup-dir lock across one token refresh (10s network
 # timeout) plus auth-status probes, so it needs more headroom than the
 # default 10s acquire used by the switch paths.
@@ -297,8 +347,8 @@ def session_dir_for(backup_dir: Path, account_num: str, email: str) -> Path:
     return backup_dir / "sessions" / f"{account_num}-{slugify_email(email)}"
 
 
-def keychain_service_name(config_dir: Path | str) -> str:
-    """Keychain service name Claude Code derives for this config dir.
+def _config_dir_digest(config_dir: Path | str) -> str:
+    """First 8 hex of ``sha256(NFC(config_dir))``, the suffix Claude Code adds.
 
     Claude hashes the raw ``CLAUDE_CONFIG_DIR`` env var value, NFC-normalized
     and unresolved (claude src ``envUtils.ts``/``macOsKeychainHelpers.ts``).
@@ -307,8 +357,25 @@ def keychain_service_name(config_dir: Path | str) -> str:
     a ``Path`` round-trip, which would drop a trailing slash or ``./``.
     """
     normalized = unicodedata.normalize("NFC", str(config_dir))
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
-    return f"Claude Code-credentials-{digest}"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
+
+
+def keychain_service_name(config_dir: Path | str) -> str:
+    """OAuth-credential Keychain service name Claude Code derives for this dir."""
+    return f"Claude Code-credentials-{_config_dir_digest(config_dir)}"
+
+
+def managed_key_service_name(config_dir: Path | str) -> str:
+    """Keychain service name of the managed API key for this config dir.
+
+    Claude Code 2.1.326 builds both service names from one function (read
+    from its binary): the OAuth item adds ``-credentials``, the managed-key
+    item adds nothing, and both append ``-<digest>`` when a config dir is set.
+    The profile's
+    ``claude auth status --json`` reading the key from this item was measured
+    on macOS 27.0 (the key shows as ``/login managed key``).
+    """
+    return f"Claude Code-{_config_dir_digest(config_dir)}"
 
 
 def _keychain_account_name() -> str:
@@ -321,20 +388,117 @@ def _keychain_account_name() -> str:
 
 
 def delete_macos_keychain_entry(session_dir: Path) -> None:
-    """Best-effort delete of a session profile's hashed keychain entry.
+    """Best-effort delete of a session profile's hashed keychain entries.
 
-    No-op off macOS. Needed before seeding (Claude reads the keychain before
-    the plaintext file, so a stale entry would shadow a fresh seed) and on
-    profile removal (once the dir is gone the hashed name is unrecoverable).
+    Deletes both the OAuth credential item and the managed API-key item, each
+    attempted even when the other fails. No-op off macOS. Needed before
+    seeding (Claude reads the keychain before the plaintext file, so a stale
+    entry would shadow a fresh seed) and on profile removal (once the dir is
+    gone the hashed names are unrecoverable).
     """
     if Platform.detect() != Platform.MACOS:
         return
+    for service in (
+        keychain_service_name(session_dir),
+        managed_key_service_name(session_dir),
+    ):
+        try:
+            macos_keychain.delete_password(service, _keychain_account_name())
+        except macos_keychain.KEYCHAIN_ERRORS:
+            pass  # best-effort; absent entry is already success (rc 44)
+
+
+def profile_api_key_state(session_dir: Path, key: str) -> str:
+    """Whether Claude Code would load ``key`` for this session profile.
+
+    ``"current"``, ``"differs"`` or ``"unknown"``; never raises. Claude Code
+    2.1.326 reads the managed key from the profile's Keychain item on macOS and
+    falls back to ``primaryApiKey`` in ``<profile>/.claude.json`` on a miss or
+    an error (read from its binary; measured on macOS 27.0: a profile with only
+    ``primaryApiKey`` loads that key), so on macOS a ``primaryApiKey`` present at all means the profile
+    is not in the shape cswap writes (the Keychain item is the only copy).
+
+    - macOS: ``current`` when the item equals ``key`` and the config has no
+      ``primaryApiKey``; ``unknown`` when the item could not be read and the
+      config has no ``primaryApiKey``; ``differs`` otherwise.
+    - Elsewhere: ``current`` when ``primaryApiKey == key``, else ``differs``.
+    """
+    config_key = _read_primary_api_key(session_dir)
+    if Platform.detect() != Platform.MACOS:
+        return "current" if config_key == key else "differs"
     try:
-        macos_keychain.delete_password(
-            keychain_service_name(session_dir), _keychain_account_name()
+        item = macos_keychain.get_password(
+            managed_key_service_name(session_dir), _keychain_account_name()
         )
     except macos_keychain.KEYCHAIN_ERRORS:
-        pass  # best-effort; absent entry is already success (rc 44)
+        return "differs" if config_key is not None else "unknown"
+    if config_key is None and item == key:
+        return "current"
+    return "differs"
+
+
+def _read_primary_api_key(session_dir: Path) -> str | None:
+    """``primaryApiKey`` from the profile's ``.claude.json``; ``None`` when
+    absent, not a string, or the file cannot be read as a JSON object."""
+    try:
+        config = json.loads(
+            (session_dir / ".claude.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    value = config.get("primaryApiKey")
+    return value if isinstance(value, str) else None
+
+
+def clear_profile_primary_api_key(session_dir: Path) -> None:
+    """Remove ``primaryApiKey`` from the profile's ``.claude.json``.
+
+    Reads without a lock first and returns when the file is missing, not a
+    regular file, not a JSON object, or has no such key, so the common case
+    never waits on Claude's config lock. Otherwise takes the lock a Claude
+    running in the profile takes for its own writes, re-reads, and writes
+    back with every other key kept. A lock timeout is logged and skipped.
+    May raise ``OSError`` only.
+    """
+    config_path = session_dir / ".claude.json"
+
+    def _holds_key() -> dict | None:
+        if config_path.is_symlink() or not config_path.is_file():
+            return None
+        try:
+            obj = json.loads(config_path.read_text(encoding="utf-8"))
+        except ValueError:
+            return None
+        if not isinstance(obj, dict) or "primaryApiKey" not in obj:
+            return None
+        return obj
+
+    if _holds_key() is None:
+        return
+    try:
+        with proper_lockfile(config_path.parent / (config_path.name + ".lock")):
+            obj = _holds_key()
+            if obj is None:
+                return
+            del obj["primaryApiKey"]
+            atomic_write_json(config_path, obj)
+    except ClaudeCodeLockTimeout as e:
+        logging.getLogger(__name__).warning(
+            f"Could not clear the API key from {config_path}: {e}"
+        )
+
+
+def is_session_profile(config_dir: str, backup_dir: Path) -> bool:
+    """Whether ``config_dir`` resolves to somewhere under ``<backup_dir>/sessions``."""
+    if not config_dir:
+        return False
+    try:
+        Path(config_dir).resolve().relative_to((backup_dir / "sessions").resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def read_session_credentials(session_dir: Path) -> str | None:
@@ -345,9 +509,10 @@ def read_session_credentials(session_dir: Path) -> str | None:
     in place, and nothing syncs them back to backup. On macOS the rotated
     credential lives in the profile's hashed keychain entry (which shadows
     the plaintext seed from the moment claude first writes it), elsewhere in
-    the profile's ``.credentials.json``. Read-only by design: writing either
-    location stays claude's job (see the module docstring on why cswap never
-    writes the hashed entry). Returns ``None`` when the profile has no
+    the profile's ``.credentials.json``. Read-only by design: writing the OAuth
+    location stays claude's job (see the module docstring on why cswap leaves
+    that hashed entry alone; the managed API-key item is the one it writes).
+    Returns ``None`` when the profile has no
     readable credential material.
     """
     return read_config_dir_credentials(str(session_dir))
@@ -746,6 +911,10 @@ class SessionManager:
         # asking, ``run.shareHistory`` in the settings file too.
         self._unlinkable_reported = False
         self._share_history_asked = False
+        # What the last API-key probe reported, for the validation failure
+        # message: ``(logged_in, authMethod, apiKeySource)``. Labels only,
+        # never a secret. ``None`` before a probe or when it gave no answer.
+        self._last_probe: tuple[bool, str | None, str | None] | None = None
 
     # -- launch ----------------------------------------------------------
 
@@ -786,9 +955,7 @@ class SessionManager:
         share_history = self._resolve_share_history(requested_history)
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
-        # Guard before the same-account direct-launch fast path below (which
-        # _exec's claude and never returns) — and before setup_session.
-        self._ensure_not_api_key(account_num, email)
+        api_key_account = self.switcher.account_kind_for(account_num) == "api_key"
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         # Same-account fast path: never create a second credential copy
@@ -798,7 +965,13 @@ class SessionManager:
         # another session's terminal) the *default* login is still what a
         # session for this account would copy, so it is read from the
         # default profile rather than from the preset directory.
-        if config_dir_preset:
+        # An API-key account has no same-account fast path: a static key
+        # cannot drift between two copies, and its own profile keeps the
+        # instance on the key when the default login later moves.
+        current: tuple[str, str] | None
+        if api_key_account:
+            current = None
+        elif config_dir_preset:
             current = self._default_login_identity()
         else:
             current = self.switcher._get_current_account()
@@ -861,7 +1034,7 @@ class SessionManager:
 
         print(
             f"{accent('Launching')} Account-{account_num} ({email}) "
-            f"{muted('[session mode]')}"
+            f"{muted('[session mode, API key]' if api_key_account else '[session mode]')}"
         )
         env = {
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
@@ -958,7 +1131,6 @@ class SessionManager:
         same store, not its own profile.
         """
         from claude_swap import oauth as _oauth
-        from claude_swap.credentials import looks_like_api_key
 
         if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
             return False
@@ -1023,20 +1195,6 @@ class SessionManager:
         os.execvpe(claude_bin, argv, env)
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _ensure_not_api_key(self, account_num: str, email: str) -> None:
-        """Reject API-key accounts in session mode (not supported yet).
-
-        Session bootstrap is OAuth-shaped — it seeds ``.credentials.json`` and
-        ``_is_session_valid`` requires ``authMethod == "claude.ai"`` — so an API-key
-        account would otherwise fail validation opaquely. Raise early with guidance.
-        """
-        if self.switcher._account_kind(account_num) == "api_key":
-            raise SessionError(
-                f"Account-{account_num} ({email}) is an API-key account; "
-                "'cswap run' (session mode) does not support API-key accounts yet. "
-                "Use 'cswap --switch-to' to make it your default login instead."
-            )
-
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
@@ -1049,9 +1207,11 @@ class SessionManager:
         """
         share_history = self._resolve_share_history(share_history)
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
-        # Defense-in-depth: also guard here (run() guards before its fast path).
-        self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        if self.switcher.account_kind_for(account_num) == "api_key":
+            return self._setup_api_key_session(
+                session_dir, account_num, email, org_uuid, share, share_history
+            )
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -1205,6 +1365,331 @@ class SessionManager:
 
         return session_dir, account_num, email
 
+    # -- API-key profiles --------------------------------------------------
+
+    def _stored_api_key(self, account_num: str, email: str) -> str:
+        """The API key stored for the slot, stripped.
+
+        Raises ``SessionError`` when the backup is unreadable right now or
+        holds no raw key (missing, or OAuth material).
+        """
+        creds, unreadable = self.switcher._read_account_credentials_ex(
+            account_num, email
+        )
+        if not creds and unreadable:
+            raise SessionError(
+                f"Account-{account_num}'s backup is in the macOS Keychain "
+                f"but it is unreadable right now (locked or no GUI "
+                f"session). Retry from a GUI terminal; do not re-add."
+            )
+        if not looks_like_api_key(creds):
+            raise self._no_stored_key_error(account_num)
+        return creds.strip()
+
+    @staticmethod
+    def _no_stored_key_error(account_num: str) -> SessionError:
+        return SessionError(
+            f"Account-{account_num} has no stored API key. "
+            f"Register it again: cswap add-token <key> --slot {account_num}"
+        )
+
+    def _api_key_probe_ok(
+        self, session_dir: Path, email: str, org_uuid: str
+    ) -> bool:
+        """Whether `claude auth status` accepts the profile as the stored key.
+
+        A probe that ran and did not answer leans on the recorded identity,
+        as the OAuth reuse check does.
+        """
+        verdict = self._session_validity(
+            session_dir, email, org_uuid, kind="api_key"
+        )
+        if verdict == "valid":
+            return True
+        if verdict == "unknown":
+            return not session_identity_drifted(session_dir, email, org_uuid)
+        return False
+
+    def _setup_api_key_session(
+        self,
+        session_dir: Path,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        share: bool,
+        share_history: bool,
+    ) -> tuple[Path, str, str]:
+        """``setup_session`` for an API-key account.
+
+        The profile holds the key where Claude Code 2.1.326 looks for a
+        managed key: the profile's Keychain item on macOS, ``primaryApiKey``
+        in the profile's ``.claude.json`` elsewhere (see
+        :func:`profile_api_key_state`). A key does not rotate, so there is no
+        token refresh and no backup grant here, and nothing on this path ever
+        deletes the profile: a failure raises and leaves it in place, because
+        the usual causes are environmental and the directory can hold the
+        account's own history.
+        """
+        # Claude would look for the key's Keychain item under that variable's
+        # location instead of the profile's. Defined but empty it makes Claude
+        # read the default profile's key while the probe still reports the
+        # session's email (read from the Claude Code 2.1.326 binary, not
+        # measured).
+        if "CLAUDE_SECURESTORAGE_CONFIG_DIR" in os.environ:
+            raise SessionError(
+                f"CLAUDE_SECURESTORAGE_CONFIG_DIR is set, so Claude Code would "
+                f"look for Account-{account_num}'s API key outside its session "
+                f"profile. Unset it for this command."
+            )
+        key = self._stored_api_key(account_num, email)
+
+        if (
+            not is_session_stale(session_dir)
+            and profile_api_key_state(session_dir, key) == "current"
+            and self._api_key_probe_ok(session_dir, email, org_uuid)
+        ):
+            self._sync_sharing(session_dir, share, share_history)
+            return session_dir, account_num, email
+
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            # `add-token` takes no lock, so the key may have changed since the
+            # read above.
+            key = self._stored_api_key(account_num, email)
+            state = profile_api_key_state(session_dir, key)
+            if state == "unknown":
+                raise self._keychain_unreadable_error(account_num)
+            if state == "current" and self._api_key_probe_ok(
+                session_dir, email, org_uuid
+            ):
+                clear_session_stale(session_dir)
+                self._sync_sharing(session_dir, share, share_history)
+                return session_dir, account_num, email
+
+            sessions, unreadable = scan_live_sessions(session_dir)
+            live = bool(sessions) or unreadable > 0
+            self._seed_api_key_profile(
+                session_dir, account_num, email, key, clear_other_axis=not live
+            )
+            self._sync_sharing(session_dir, share, share_history)
+
+            newer = self._stored_api_key(account_num, email)
+            if newer != key:
+                key = newer
+                self._seed_api_key_profile(
+                    session_dir, account_num, email, key, clear_other_axis=not live
+                )
+
+            final_state = profile_api_key_state(session_dir, key)
+            if final_state == "unknown":
+                raise self._keychain_unreadable_error(account_num)
+            if final_state != "current":
+                raise SessionError(
+                    f"Account-{account_num}'s session profile does not hold the "
+                    f"stored key after setup. Run again; if it repeats, run "
+                    f"with --debug and check the log."
+                )
+            clear_session_stale(session_dir)
+            if live:
+                pids = ", ".join(str(s.pid) for s in sessions) or "unknown"
+                warning(
+                    f"Account-{account_num}'s profile has running sessions "
+                    f"(PID {pids}). The stored key was written in place; those "
+                    f"sessions keep the key they started with until they "
+                    f"restart."
+                )
+
+            verdict = self._session_validity(
+                session_dir, email, org_uuid, kind="api_key"
+            )
+            if verdict == "unknown" and not session_identity_drifted(
+                session_dir, email, org_uuid
+            ):
+                verdict = "valid"
+            if verdict in ("unknown", "unreachable"):
+                raise SessionError(
+                    f"Session profile for Account-{account_num} ({email}) could "
+                    f"not be verified: `claude auth status` did not run or did "
+                    f"not answer. The profile is left in place — check that "
+                    f"`claude` is on PATH, then retry."
+                )
+            if verdict != "valid":
+                raise SessionError(
+                    f"Session profile for Account-{account_num} ({email}) failed "
+                    f"validation: Claude Code reports "
+                    f"{self._describe_last_probe()} for it, not the stored API "
+                    f"key. {self._api_key_failure_hint(live)} The profile was "
+                    f"left in place."
+                )
+        # Lock released here, before any exec.
+
+        return session_dir, account_num, email
+
+    def _describe_last_probe(self) -> str:
+        probe = self._last_probe
+        if probe is None or not probe[0]:
+            return "not logged in"
+        return f"authMethod={probe[1]}, apiKeySource={probe[2]}"
+
+    def _api_key_failure_hint(self, live: bool) -> str:
+        probe = self._last_probe
+        if probe is not None and probe[2] == _API_KEY_HELPER_SOURCE:
+            return (
+                "An apiKeyHelper setting outranks a stored key; run with "
+                "--no-share to leave your settings.json out of the profile."
+            )
+        if probe is not None and probe[1] == _THIRD_PARTY_AUTH_METHOD:
+            return (
+                "A third-party provider is configured in this environment, and "
+                "Claude Code then ignores a stored key."
+            )
+        if live:
+            return "Sessions are running in this profile; exit them and run again."
+        return (
+            "If Claude Code was updated since this last worked, cswap may "
+            "need an update."
+        )
+
+    @staticmethod
+    def _keychain_unreadable_error(account_num: str) -> SessionError:
+        return SessionError(
+            f"The macOS Keychain could not be read (locked or busy), "
+            f"so Account-{account_num}'s session profile could not be "
+            f"checked. Unlock the Keychain and run again."
+        )
+
+    def _seed_api_key_profile(
+        self,
+        session_dir: Path,
+        account_num: str,
+        email: str,
+        key: str,
+        *,
+        clear_other_axis: bool,
+    ) -> None:
+        """Write the key (and, unless a Claude is live, the identity) into the
+        profile. Caller holds the cswap ``FileLock``.
+
+        ``clear_other_axis`` is False while a Claude runs in the profile:
+        nothing it depends on is deleted, and its identity is left as it is.
+
+        The order is: the config splice, then clearing the OAuth login
+        (``.credentials.json`` and its Keychain item; skipped while a Claude is
+        live), then the key. A config that cannot be spliced (unreadable, or
+        locked by a running Claude) therefore leaves the OAuth login in place.
+        Writing the config before the key means a failure between them
+        leaves a profile with an identity and no key (state ``"differs"``, seeded
+        again on the next launch), never a key with no identity. On macOS the
+        key is written only to the Keychain item: Claude Code 2.1.326's own
+        key save errors rather than fall back to plain text there, and so does
+        this. In 2.1.326 nothing migrates a plaintext key into the Keychain
+        later, which is why cswap writes this item itself. (Both read from the
+        2.1.326 binary, not measured.)
+        """
+        config_text = self.switcher.read_account_config(account_num, email)
+        try:
+            config_data = json.loads(config_text) if config_text else {}
+        except json.JSONDecodeError:
+            config_data = {}
+        oauth_account = (
+            config_data.get("oauthAccount") if isinstance(config_data, dict) else None
+        )
+        if not oauth_account:
+            raise self._no_stored_key_error(account_num)
+
+        config_path = session_dir / ".claude.json"
+        unreadable = SessionError(
+            f"{config_path} could not be read, so Account-{account_num}'s "
+            f"session profile was not changed. Move the file aside and run "
+            f"again."
+        )
+
+        def read_profile_config() -> dict:
+            if config_path.is_symlink():
+                raise unreadable
+            if not config_path.exists():
+                return {}
+            if not config_path.is_file():
+                raise unreadable
+            try:
+                loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                raise unreadable from None
+            if not isinstance(loaded, dict):
+                raise unreadable
+            return loaded
+
+        # Before anything is changed: a config that cannot be spliced must
+        # leave the profile as it was. The splice below reads it again under
+        # the lock.
+        read_profile_config()
+
+        session_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(session_dir, 0o700)
+        on_macos = Platform.detect() == Platform.MACOS
+
+        try:
+            with proper_lockfile(config_path.parent / (config_path.name + ".lock")):
+                obj = read_profile_config()
+
+                responses = obj.get("customApiKeyResponses")
+                if not isinstance(responses, dict):
+                    responses = {}
+                approved = responses.get("approved")
+                if not isinstance(approved, list):
+                    approved = []
+                if approved_form(key) not in approved:
+                    approved.append(approved_form(key))
+                responses["approved"] = approved
+                responses.setdefault("rejected", [])
+                obj["customApiKeyResponses"] = responses
+
+                if on_macos:
+                    obj.pop("primaryApiKey", None)
+                else:
+                    obj["primaryApiKey"] = key
+                if clear_other_axis:
+                    obj["oauthAccount"] = oauth_account
+                    obj["hasCompletedOnboarding"] = True
+                    obj.setdefault("theme", config_data.get("theme") or "dark")
+                atomic_write_text(config_path, json.dumps(obj, indent=2))
+        except ClaudeCodeLockTimeout:
+            raise SessionError(
+                f"{config_path} is locked by a running Claude. Run again in a "
+                f"moment."
+            ) from None
+
+        if clear_other_axis:
+            (session_dir / ".credentials.json").unlink(missing_ok=True)
+            if on_macos:
+                try:
+                    macos_keychain.delete_password(
+                        keychain_service_name(session_dir), _keychain_account_name()
+                    )
+                except macos_keychain.KEYCHAIN_ERRORS:
+                    pass  # best-effort; the key is checked below
+
+        if on_macos:
+            try:
+                macos_keychain.set_password(
+                    managed_key_service_name(session_dir),
+                    _keychain_account_name(),
+                    key,
+                )
+            except macos_keychain.KEYCHAIN_ERRORS:
+                # No `from`: the cause is not part of the message, and a
+                # chained exception could carry the key.
+                raise SessionError(
+                    f"The macOS Keychain did not accept Account-{account_num}'s "
+                    f"API key (locked or busy), so its session profile was not "
+                    f"set up. Unlock the Keychain and run again."
+                ) from None
+
+        self._logger.info(
+            f"Seeded API-key session profile for account {account_num} at "
+            f"{session_dir}"
+        )
+
     def _profile_matches_backup(
         self, session_dir: Path, account_num: str, email: str
     ) -> bool:
@@ -1315,7 +1800,7 @@ class SessionManager:
     # -- validation ------------------------------------------------------
 
     def _session_validity(
-        self, session_dir: Path, email: str, org_uuid: str
+        self, session_dir: Path, email: str, org_uuid: str, *, kind: str = "oauth"
     ) -> str:
         """``"valid"`` / ``"invalid"`` / ``"unknown"`` / ``"unreachable"``.
 
@@ -1338,7 +1823,17 @@ class SessionManager:
         invalid: a binary we cannot run cannot serve the session either way,
         so the honest outcome is the bootstrap path and its "check that
         `claude` is on PATH" error, not a silent reuse.
+
+        ``kind="api_key"`` checks the profile against a managed API key
+        instead of a claude.ai login (Claude Code 2.1.326, measured on macOS
+        27.0): ``authMethod`` is :data:`API_KEY_AUTH_METHOD` and
+        ``apiKeySource`` is :data:`MANAGED_KEY_SOURCE`. ``email`` may be
+        absent from the status (Claude omits it when the profile also holds an
+        emptied OAuth login; read from the 2.1.326 binary, not measured);
+        present, it must match. What the probe reported
+        is kept in ``self._last_probe`` for the caller's failure message.
         """
+        self._last_probe = None
         if not session_dir.is_dir():
             return "invalid"
         # On Windows `claude` is a `.cmd` shim, and a bare "claude" passed to
@@ -1373,14 +1868,32 @@ class SessionManager:
             return "unknown"
         if not isinstance(status, dict):
             return "unknown"
+        auth_method = status.get("authMethod")
+        key_source = status.get("apiKeySource")
+        self._last_probe = (
+            status.get("loggedIn") is True,
+            auth_method if isinstance(auth_method, str) else None,
+            key_source if isinstance(key_source, str) else None,
+        )
         if status.get("loggedIn") is not True:
             return "invalid"
-        # Verified against claude 2.1.175; an env API key reports a different
-        # method, and the probe env already drops those vars anyway.
-        if status.get("authMethod") != "claude.ai":
-            return "invalid"
-        if status.get("email") != email:
-            return "invalid"
+        if kind == "api_key":
+            if (
+                auth_method != API_KEY_AUTH_METHOD
+                or key_source != MANAGED_KEY_SOURCE
+            ):
+                return "invalid"
+            status_email = status.get("email")
+            if status_email and status_email != email:
+                return "invalid"
+        else:
+            # Verified against claude 2.1.175; an env API key reports a
+            # different method, and the probe env already drops those vars
+            # anyway.
+            if auth_method != "claude.ai":
+                return "invalid"
+            if status.get("email") != email:
+                return "invalid"
         # Lenient org check: only when both sides have a value, so schema
         # drift degrades to email-only validation instead of false negatives.
         status_org = status.get("orgId")

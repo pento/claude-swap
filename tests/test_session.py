@@ -23,6 +23,7 @@ from claude_swap import session as session_mod
 from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ClaudeCodeLockTimeout,
     CredentialReadError,
     LockError,
     SessionError,
@@ -667,7 +668,8 @@ class TestIsSessionValid:
         assert self.check(manager, tmp_path, monkeypatch, valid_payload)
 
     def test_rejects_api_key_auth(self, manager, tmp_path, monkeypatch, valid_payload):
-        valid_payload["authMethod"] = "apiKey"
+        # "api_key" is what Claude Code 2.1.326 emits for a managed key.
+        valid_payload["authMethod"] = "api_key"
         assert not self.check(manager, tmp_path, monkeypatch, valid_payload)
 
     def test_rejects_wrong_email(self, manager, tmp_path, monkeypatch, valid_payload):
@@ -1568,6 +1570,14 @@ class TestRun:
 
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
         assert "already the active default login" in capsys.readouterr().out
+
+    def test_oauth_account_is_unaffected_by_securestorage_dir(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, monkeypatch
+    ):
+        # Only an API-key account refuses CLAUDE_SECURESTORAGE_CONFIG_DIR.
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
 
     def test_require_session_refuses_fast_path(
         self, manager, capture_exec, monkeypatch
@@ -5525,3 +5535,330 @@ class TestDefaultLoginSignedOut:
         monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
 
         assert manager._default_login_signed_out() is True
+
+
+# ---------------------------------------------------------------------------
+# API-key profile primitives
+# ---------------------------------------------------------------------------
+
+_PROFILE_KEY = "sk-ant-api03-" + "A" * 80
+_OTHER_PROFILE_KEY = "sk-ant-api03-" + "B" * 80
+
+
+@pytest.fixture
+def linux_platform(monkeypatch):
+    monkeypatch.setattr(
+        Platform, "detect", classmethod(lambda cls: Platform.LINUX)
+    )
+
+
+def _write_profile_config(session_dir: Path, obj) -> Path:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    path = session_dir / ".claude.json"
+    path.write_text(obj if isinstance(obj, str) else json.dumps(obj))
+    return path
+
+
+class TestManagedKeyServiceName:
+    def test_shares_the_digest_with_the_oauth_name(self, tmp_path):
+        d = tmp_path / "profile"
+        digest = hashlib.sha256(
+            unicodedata.normalize("NFC", str(d)).encode()
+        ).hexdigest()[:8]
+        assert session_mod.managed_key_service_name(d) == f"Claude Code-{digest}"
+        assert keychain_service_name(d) == f"Claude Code-credentials-{digest}"
+
+    def test_nfc_nfd_equal(self):
+        nfc = unicodedata.normalize("NFC", "/tmp/sé")
+        nfd = unicodedata.normalize("NFD", "/tmp/sé")
+        assert nfc != nfd
+        assert session_mod.managed_key_service_name(
+            nfc
+        ) == session_mod.managed_key_service_name(nfd)
+
+    def test_str_and_path_agree(self, tmp_path):
+        assert session_mod.managed_key_service_name(
+            tmp_path
+        ) == session_mod.managed_key_service_name(str(tmp_path))
+
+
+class TestDeleteMacosKeychainEntry:
+    def test_removes_both_items(self, tmp_path, macos_platform, block_real_keychain):
+        account = session_mod._keychain_account_name()
+        for service in (
+            keychain_service_name(tmp_path),
+            session_mod.managed_key_service_name(tmp_path),
+        ):
+            block_real_keychain.set_password(service, account, "x")
+        session_mod.delete_macos_keychain_entry(tmp_path)
+        assert block_real_keychain.data == {}
+
+    def test_failure_on_one_still_attempts_the_other(
+        self, tmp_path, macos_platform, block_real_keychain, monkeypatch
+    ):
+        account = session_mod._keychain_account_name()
+        oauth_service = keychain_service_name(tmp_path)
+        key_service = session_mod.managed_key_service_name(tmp_path)
+        block_real_keychain.set_password(oauth_service, account, "x")
+        block_real_keychain.set_password(key_service, account, "y")
+        real_delete = macos_keychain.delete_password
+        attempted = []
+
+        def flaky(service, acct):
+            attempted.append(service)
+            if service == oauth_service:
+                raise macos_keychain.KeychainError("locked")
+            return real_delete(service, acct)
+
+        monkeypatch.setattr(macos_keychain, "delete_password", flaky)
+        session_mod.delete_macos_keychain_entry(tmp_path)
+        assert set(attempted) == {oauth_service, key_service}
+        assert (key_service, account) not in block_real_keychain.data
+
+    def test_no_keychain_call_off_macos(
+        self, tmp_path, linux_platform, monkeypatch
+    ):
+        def boom(*a, **k):
+            raise AssertionError("Keychain touched off macOS")
+
+        monkeypatch.setattr(macos_keychain, "delete_password", boom)
+        session_mod.delete_macos_keychain_entry(tmp_path)
+
+
+class TestProfileApiKeyStateMacos:
+    def _set_item(self, store, session_dir, value):
+        store.set_password(
+            session_mod.managed_key_service_name(session_dir),
+            session_mod._keychain_account_name(),
+            value,
+        )
+
+    def test_item_equals_key_no_config_key_is_current(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        self._set_item(block_real_keychain, tmp_path, _PROFILE_KEY)
+        _write_profile_config(tmp_path, {"theme": "dark"})
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "current"
+
+    def test_missing_config_file_is_current_when_item_matches(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        self._set_item(block_real_keychain, tmp_path, _PROFILE_KEY)
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "current"
+
+    def test_item_absent_differs(self, tmp_path, macos_platform, block_real_keychain):
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "differs"
+
+    def test_item_other_value_differs(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        self._set_item(block_real_keychain, tmp_path, _OTHER_PROFILE_KEY)
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "differs"
+
+    def test_config_key_present_differs_even_if_item_matches(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        self._set_item(block_real_keychain, tmp_path, _PROFILE_KEY)
+        _write_profile_config(tmp_path, {"primaryApiKey": _PROFILE_KEY})
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "differs"
+
+    def test_item_read_raises_without_config_key_is_unknown(
+        self, tmp_path, macos_platform, block_real_keychain, monkeypatch
+    ):
+        def locked(*a, **k):
+            raise macos_keychain.KeychainError("locked")
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+        _write_profile_config(tmp_path, {"theme": "dark"})
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "unknown"
+
+    def test_item_read_raises_with_config_key_differs(
+        self, tmp_path, macos_platform, block_real_keychain, monkeypatch
+    ):
+        def locked(*a, **k):
+            raise macos_keychain.KeychainError("locked")
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+        _write_profile_config(tmp_path, {"primaryApiKey": _PROFILE_KEY})
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "differs"
+
+
+class TestProfileApiKeyStateElsewhere:
+    @pytest.fixture(autouse=True)
+    def _no_keychain(self, linux_platform, monkeypatch):
+        def boom(*a, **k):
+            raise AssertionError("Keychain touched off macOS")
+
+        monkeypatch.setattr(macos_keychain, "get_password", boom)
+
+    def test_equal_is_current(self, tmp_path):
+        _write_profile_config(tmp_path, {"primaryApiKey": _PROFILE_KEY})
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "current"
+
+    def test_absent_differs(self, tmp_path):
+        _write_profile_config(tmp_path, {"theme": "dark"})
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "differs"
+
+    def test_other_value_differs(self, tmp_path):
+        _write_profile_config(tmp_path, {"primaryApiKey": _OTHER_PROFILE_KEY})
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "differs"
+
+    def test_corrupt_config_differs(self, tmp_path):
+        _write_profile_config(tmp_path, "{not json")
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "differs"
+
+    def test_missing_config_differs(self, tmp_path):
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "differs"
+
+    def test_non_ascii_config_is_read_as_utf8(self, tmp_path):
+        # Claude Code writes .claude.json as UTF-8; "の" encodes with a byte
+        # (0x81) that a cp1252 locale cannot decode.
+        (tmp_path / ".claude.json").write_bytes(
+            json.dumps(
+                {"primaryApiKey": _PROFILE_KEY, "projects": {"C:/Users/José/の": {}}},
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "current"
+
+
+class TestClearProfilePrimaryApiKey:
+    def test_removes_only_that_key(self, tmp_path):
+        path = _write_profile_config(
+            tmp_path,
+            {"primaryApiKey": _PROFILE_KEY, "theme": "dark", "n": {"a": 1}},
+        )
+        session_mod.clear_profile_primary_api_key(tmp_path)
+        assert json.loads(path.read_text()) == {"theme": "dark", "n": {"a": 1}}
+
+    def test_keeps_non_ascii_content_intact(self, tmp_path):
+        projects = {"C:/Users/José/の": {"allowedTools": []}}
+        path = tmp_path / ".claude.json"
+        path.write_bytes(
+            json.dumps(
+                {"primaryApiKey": _PROFILE_KEY, "projects": projects},
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        session_mod.clear_profile_primary_api_key(tmp_path)
+        assert json.loads(path.read_text(encoding="utf-8")) == {"projects": projects}
+
+    def test_no_lock_when_key_absent(self, tmp_path, monkeypatch):
+        path = _write_profile_config(tmp_path, {"theme": "dark"})
+        before = path.read_bytes()
+
+        def boom(*a, **k):
+            raise AssertionError("lock taken")
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", boom)
+        session_mod.clear_profile_primary_api_key(tmp_path)
+        assert path.read_bytes() == before
+
+    def test_takes_the_config_lock_when_key_present(self, tmp_path, monkeypatch):
+        _write_profile_config(tmp_path, {"primaryApiKey": _PROFILE_KEY})
+        taken = []
+        real = session_mod.proper_lockfile
+
+        def spy(lock_dir, **kw):
+            taken.append(lock_dir)
+            return real(lock_dir, **kw)
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", spy)
+        session_mod.clear_profile_primary_api_key(tmp_path)
+        assert taken == [tmp_path / ".claude.json.lock"]
+
+    def test_lock_timeout_returns_quietly_and_leaves_file(
+        self, tmp_path, monkeypatch
+    ):
+        path = _write_profile_config(tmp_path, {"primaryApiKey": _PROFILE_KEY})
+        before = path.read_bytes()
+
+        class _Timeout:
+            def __enter__(self):
+                raise ClaudeCodeLockTimeout("held")
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", lambda *a, **k: _Timeout())
+        session_mod.clear_profile_primary_api_key(tmp_path)
+        assert path.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        "content",
+        [None, "{not json", "[1, 2]", '"primaryApiKey"'],
+        ids=["missing", "unparseable", "array", "string"],
+    )
+    def test_noop_when_config_is_not_an_object(self, tmp_path, monkeypatch, content):
+        tmp_path.mkdir(exist_ok=True)
+        if content is not None:
+            (tmp_path / ".claude.json").write_text(content)
+
+        def boom(*a, **k):
+            raise AssertionError("lock taken")
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", boom)
+        session_mod.clear_profile_primary_api_key(tmp_path)
+        if content is not None:
+            assert (tmp_path / ".claude.json").read_text() == content
+
+    def test_noop_when_config_is_a_directory(self, tmp_path, monkeypatch):
+        (tmp_path / ".claude.json").mkdir()
+
+        def boom(*a, **k):
+            raise AssertionError("lock taken")
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", boom)
+        session_mod.clear_profile_primary_api_key(tmp_path)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_noop_when_config_is_a_symlink(self, tmp_path, monkeypatch):
+        target = tmp_path / "target.json"
+        target.write_text(json.dumps({"primaryApiKey": _PROFILE_KEY}))
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / ".claude.json").symlink_to(target)
+
+        def boom(*a, **k):
+            raise AssertionError("lock taken")
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", boom)
+        session_mod.clear_profile_primary_api_key(profile)
+        assert "primaryApiKey" in json.loads(target.read_text())
+
+
+class TestIsSessionProfile:
+    def test_inside(self, tmp_path):
+        inside = tmp_path / "sessions" / "2-a_x.com"
+        inside.mkdir(parents=True)
+        assert session_mod.is_session_profile(str(inside), tmp_path)
+
+    def test_outside(self, tmp_path):
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        assert not session_mod.is_session_profile(str(outside), tmp_path)
+
+    def test_sessions_dir_sibling_prefix_is_outside(self, tmp_path):
+        sibling = tmp_path / "sessions-other" / "x"
+        sibling.mkdir(parents=True)
+        assert not session_mod.is_session_profile(str(sibling), tmp_path)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_symlink_resolving_outside(self, tmp_path):
+        (tmp_path / "sessions").mkdir()
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        link = tmp_path / "sessions" / "2-a_x.com"
+        link.symlink_to(outside)
+        assert not session_mod.is_session_profile(str(link), tmp_path)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_symlink_resolving_inside(self, tmp_path):
+        real = tmp_path / "sessions" / "2-a_x.com"
+        real.mkdir(parents=True)
+        link = tmp_path / "alias"
+        link.symlink_to(real)
+        assert session_mod.is_session_profile(str(link), tmp_path)
+
+    def test_empty(self, tmp_path):
+        assert not session_mod.is_session_profile("", tmp_path)

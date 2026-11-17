@@ -102,7 +102,7 @@ Read next: the docstrings of `consume_backup_grant` and `_fetch_active_usage`.
 
 `cswap run` calls `SessionManager.run`. `setup_session` creates or reuses the account's profile directory, seeds it with the slot's credential, and links the user's settings and history from `~/.claude` into it. Claude Code is then started with `CLAUDE_CONFIG_DIR` pointing at the profile, which leaves the default login untouched.
 
-If the account is already the active default login, it starts plain `claude` instead, because two copies of one credential drift apart.
+If the account is already the active default login, it starts plain `claude` instead, because two copies of one credential drift apart. An API-key account always gets its profile: a key does not rotate.
 
 Read next: the module docstring of `session.py`.
 
