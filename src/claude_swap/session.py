@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -297,8 +298,8 @@ def session_dir_for(backup_dir: Path, account_num: str, email: str) -> Path:
     return backup_dir / "sessions" / f"{account_num}-{slugify_email(email)}"
 
 
-def keychain_service_name(config_dir: Path | str) -> str:
-    """Keychain service name Claude Code derives for this config dir.
+def _config_dir_digest(config_dir: Path | str) -> str:
+    """First 8 hex of ``sha256(NFC(config_dir))``, the suffix Claude Code adds.
 
     Claude hashes the raw ``CLAUDE_CONFIG_DIR`` env var value, NFC-normalized
     and unresolved (claude src ``envUtils.ts``/``macOsKeychainHelpers.ts``).
@@ -307,8 +308,24 @@ def keychain_service_name(config_dir: Path | str) -> str:
     a ``Path`` round-trip, which would drop a trailing slash or ``./``.
     """
     normalized = unicodedata.normalize("NFC", str(config_dir))
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
-    return f"Claude Code-credentials-{digest}"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
+
+
+def keychain_service_name(config_dir: Path | str) -> str:
+    """OAuth-credential Keychain service name Claude Code derives for this dir."""
+    return f"Claude Code-credentials-{_config_dir_digest(config_dir)}"
+
+
+def managed_key_service_name(config_dir: Path | str) -> str:
+    """Keychain service name of the managed API key for this config dir.
+
+    Claude Code 2.1.326 builds both service names from one function: the OAuth
+    item adds ``-credentials``, the managed-key item adds nothing, and both
+    append ``-<digest>`` when a config dir is set. The profile's
+    ``claude auth status --json`` reading the key from this item was measured
+    on macOS 27.0 (the key shows as ``/login managed key``).
+    """
+    return f"Claude Code-{_config_dir_digest(config_dir)}"
 
 
 def _keychain_account_name() -> str:
@@ -321,20 +338,114 @@ def _keychain_account_name() -> str:
 
 
 def delete_macos_keychain_entry(session_dir: Path) -> None:
-    """Best-effort delete of a session profile's hashed keychain entry.
+    """Best-effort delete of a session profile's hashed keychain entries.
 
-    No-op off macOS. Needed before seeding (Claude reads the keychain before
-    the plaintext file, so a stale entry would shadow a fresh seed) and on
-    profile removal (once the dir is gone the hashed name is unrecoverable).
+    Deletes both the OAuth credential item and the managed API-key item, each
+    attempted even when the other fails. No-op off macOS. Needed before
+    seeding (Claude reads the keychain before the plaintext file, so a stale
+    entry would shadow a fresh seed) and on profile removal (once the dir is
+    gone the hashed names are unrecoverable).
     """
     if Platform.detect() != Platform.MACOS:
         return
+    for service in (
+        keychain_service_name(session_dir),
+        managed_key_service_name(session_dir),
+    ):
+        try:
+            macos_keychain.delete_password(service, _keychain_account_name())
+        except macos_keychain.KEYCHAIN_ERRORS:
+            pass  # best-effort; absent entry is already success (rc 44)
+
+
+def profile_api_key_state(session_dir: Path, key: str) -> str:
+    """Whether Claude Code would load ``key`` for this session profile.
+
+    ``"current"``, ``"differs"`` or ``"unknown"``; never raises. Claude Code
+    2.1.326 reads the managed key from the profile's Keychain item on macOS and
+    falls back to ``primaryApiKey`` in ``<profile>/.claude.json`` on a miss or
+    an error, so on macOS a ``primaryApiKey`` present at all means the profile
+    is not in the shape cswap writes (the Keychain item is the only copy).
+
+    - macOS: ``current`` when the item equals ``key`` and the config has no
+      ``primaryApiKey``; ``unknown`` when the item could not be read and the
+      config has no ``primaryApiKey``; ``differs`` otherwise.
+    - Elsewhere: ``current`` when ``primaryApiKey == key``, else ``differs``.
+    """
+    config_key = _read_primary_api_key(session_dir)
+    if Platform.detect() != Platform.MACOS:
+        return "current" if config_key == key else "differs"
     try:
-        macos_keychain.delete_password(
-            keychain_service_name(session_dir), _keychain_account_name()
+        item = macos_keychain.get_password(
+            managed_key_service_name(session_dir), _keychain_account_name()
         )
     except macos_keychain.KEYCHAIN_ERRORS:
-        pass  # best-effort; absent entry is already success (rc 44)
+        return "differs" if config_key is not None else "unknown"
+    if config_key is None and item == key:
+        return "current"
+    return "differs"
+
+
+def _read_primary_api_key(session_dir: Path) -> str | None:
+    """``primaryApiKey`` from the profile's ``.claude.json``; ``None`` when
+    absent, not a string, or the file cannot be read as a JSON object."""
+    try:
+        config = json.loads((session_dir / ".claude.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    value = config.get("primaryApiKey")
+    return value if isinstance(value, str) else None
+
+
+def clear_profile_primary_api_key(session_dir: Path) -> None:
+    """Remove ``primaryApiKey`` from the profile's ``.claude.json``.
+
+    Reads without a lock first and returns when the file is missing, not a
+    regular file, not a JSON object, or has no such key, so the common case
+    never waits on Claude's config lock. Otherwise takes the lock a Claude
+    running in the profile takes for its own writes, re-reads, and writes
+    back with every other key kept. A lock timeout is logged and skipped.
+    May raise ``OSError`` only.
+    """
+    config_path = session_dir / ".claude.json"
+
+    def _holds_key() -> dict | None:
+        if config_path.is_symlink() or not config_path.is_file():
+            return None
+        try:
+            obj = json.loads(config_path.read_text())
+        except ValueError:
+            return None
+        if not isinstance(obj, dict) or "primaryApiKey" not in obj:
+            return None
+        return obj
+
+    if _holds_key() is None:
+        return
+    try:
+        with proper_lockfile(config_path.parent / (config_path.name + ".lock")):
+            obj = _holds_key()
+            if obj is None:
+                return
+            del obj["primaryApiKey"]
+            atomic_write_json(config_path, obj)
+    except ClaudeCodeLockTimeout as e:
+        logging.getLogger(__name__).warning(
+            f"Could not clear the API key from {config_path}: {e}"
+        )
+
+
+def is_session_profile(config_dir: str, backup_dir: Path) -> bool:
+    """Whether ``config_dir`` resolves to somewhere under ``<backup_dir>/sessions``."""
+    if not config_dir:
+        return False
+    try:
+        Path(config_dir).resolve().relative_to((backup_dir / "sessions").resolve())
+    except (ValueError, OSError):
+        return False
+    return True
 
 
 def read_session_credentials(session_dir: Path) -> str | None:
