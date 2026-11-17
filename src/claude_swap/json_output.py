@@ -199,14 +199,16 @@ def usage_from_json(usage: object) -> dict:
     """Read a ``usage`` object from ``list --json`` back into the internal dict.
 
     The inverse of :func:`usage_to_json` for what the API measured: ``pct``,
-    ``resetsAt``, the spend amounts and the scoped model names. Everything
+    ``resetsAt``, the spend amounts, the scoped model names and each scoped
+    window's ``shareOfWeekly``. Everything
     derived at serialization (countdown, clock, pace fields) is dropped, and
     the fetch-time strings are rebuilt from ``resets_at``, which gives the
     shape :func:`oauth.build_usage_result` stores. A 5h/7d window's ``pct``
     may be ``null`` (reported without a figure), except in a ``source:
     headers`` document, which the probe never produces that way. Raises
     ``ValueError`` on anything malformed, so an importer can refuse a
-    document before writing any of it.
+    document before writing any of it. The one exception is a malformed
+    ``shareOfWeekly``: it is optional, so it is dropped, not refused.
     """
     if not isinstance(usage, dict):
         raise ValueError("usage must be an object")
