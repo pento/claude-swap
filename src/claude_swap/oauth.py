@@ -1073,7 +1073,9 @@ def valid_share_of_weekly(share: object) -> dict | None:
         v = share.get(key)
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             return None
-        if not math.isfinite(v) or not 0 <= v <= 100:
+        # The range test alone also refuses NaN and infinities; isfinite()
+        # would raise OverflowError on an int too large for a float.
+        if not 0 <= v <= 100:
             return None
         out[key] = v
     return out

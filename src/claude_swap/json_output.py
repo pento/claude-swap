@@ -271,6 +271,9 @@ def usage_from_json(usage: object) -> dict:
         for key, label in (("five_hour", "fiveHour"), ("seven_day", "sevenDay")):
             if key in out and out[key]["pct"] is None:
                 raise ValueError(f"{label}.pct cannot be null in a headers reading")
+        # The header probe has no per-model share, so one here is dropped.
+        for entry in out.get("scoped", ()):
+            entry.pop("share_of_weekly", None)
         out["source"] = oauth.USAGE_SOURCE_HEADERS
     return out
 

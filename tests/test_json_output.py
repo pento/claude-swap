@@ -844,6 +844,16 @@ class TestUsageFromJson:
             {"scoped": [{"name": "Fable", "pct": 1, "shareOfWeekly": {"used": 500}}]}
         )
         assert "share_of_weekly" not in bad["scoped"][0]
+        huge = usage_from_json(
+            {"scoped": [{"name": "Fable", "pct": 1,
+                         "shareOfWeekly": {"used": 10 ** 400, "allowance": 50}}]}
+        )
+        assert "share_of_weekly" not in huge["scoped"][0]
+        headers = usage_from_json({
+            "fiveHour": {"pct": 5}, "sevenDay": {"pct": 6}, "source": "headers",
+            "scoped": [{"name": "Fable", "pct": 1, "shareOfWeekly": share}],
+        })
+        assert "share_of_weekly" not in headers["scoped"][0]
 
     @pytest.mark.parametrize("bad", [5, "soon", ""])
     def test_an_unreadable_probe_pause_is_refused(self, bad):

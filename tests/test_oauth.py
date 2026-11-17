@@ -441,6 +441,9 @@ class TestFetchUsage:
         {"limit_index": 2, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": -1},
         {"limit_index": 2, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": "50"},
         {"limit_index": 2, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": None},
+        {"limit_index": 2, "used_percent_of_weekly": 10 ** 400, "allowance_percent_of_weekly": 50},
+        {"limit_index": 2, "used_percent_of_weekly": float("nan"), "allowance_percent_of_weekly": 50},
+        {"limit_index": 2, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": float("inf")},
         "nope",
     ])
     def test_malformed_scoped_share_is_ignored(self, row):
