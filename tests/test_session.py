@@ -668,7 +668,8 @@ class TestIsSessionValid:
         assert self.check(manager, tmp_path, monkeypatch, valid_payload)
 
     def test_rejects_api_key_auth(self, manager, tmp_path, monkeypatch, valid_payload):
-        valid_payload["authMethod"] = "apiKey"
+        # "api_key" is what Claude Code 2.1.326 emits for a managed key.
+        valid_payload["authMethod"] = "api_key"
         assert not self.check(manager, tmp_path, monkeypatch, valid_payload)
 
     def test_rejects_wrong_email(self, manager, tmp_path, monkeypatch, valid_payload):
@@ -1569,6 +1570,14 @@ class TestRun:
 
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
         assert "already the active default login" in capsys.readouterr().out
+
+    def test_oauth_account_is_unaffected_by_securestorage_dir(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, monkeypatch
+    ):
+        # Only an API-key account refuses CLAUDE_SECURESTORAGE_CONFIG_DIR.
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
 
     def test_require_session_refuses_fast_path(
         self, manager, capture_exec, monkeypatch
