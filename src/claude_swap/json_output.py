@@ -102,11 +102,16 @@ def _scoped_window_to_json(entry: dict, fetched_at: float | None) -> dict:
     ``probeAfter`` marks a row the header probe read as spent and keeps
     until then instead of asking again (``oauth._add_scoped_limits``). It
     survives export so a machine importing the reading keeps it too.
+    ``shareOfWeekly`` (``used``/``allowance``, percent of the weekly limit)
+    is the usage API's per-model share; absent on a header-probe reading.
     """
     out = _weekly_window_to_json(entry, fetched_at)
     out["name"] = entry["name"]
     if "probe_after" in entry:
         out["probeAfter"] = entry["probe_after"]
+    share = oauth.valid_share_of_weekly(entry.get("share_of_weekly"))
+    if share is not None:
+        out["shareOfWeekly"] = share
     return out
 
 
@@ -240,6 +245,9 @@ def usage_from_json(usage: object) -> dict:
                 if not isinstance(probe_after, str) or parse_reset_ts(probe_after) is None:
                     raise ValueError(f"{label}.probeAfter must be an ISO-8601 time")
                 entry["probe_after"] = probe_after
+            share = oauth.valid_share_of_weekly(window.get("shareOfWeekly"))
+            if share is not None:
+                entry["share_of_weekly"] = share
             scoped.append({"name": name, **entry})
         out["scoped"] = scoped
     if "rejected" in usage:
