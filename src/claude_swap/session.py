@@ -1457,11 +1457,7 @@ class SessionManager:
             key = self._stored_api_key(account_num, email)
             state = profile_api_key_state(session_dir, key)
             if state == "unknown":
-                raise SessionError(
-                    f"The macOS Keychain could not be read (locked or busy), "
-                    f"so Account-{account_num}'s session profile could not be "
-                    f"checked. Unlock the Keychain and run again."
-                )
+                raise self._keychain_unreadable_error(account_num)
             if state == "current" and self._api_key_probe_ok(
                 session_dir, email, org_uuid
             ):
@@ -1483,7 +1479,10 @@ class SessionManager:
                     session_dir, account_num, email, key, clear_other_axis=not live
                 )
 
-            if profile_api_key_state(session_dir, key) != "current":
+            final_state = profile_api_key_state(session_dir, key)
+            if final_state == "unknown":
+                raise self._keychain_unreadable_error(account_num)
+            if final_state != "current":
                 raise SessionError(
                     f"Account-{account_num}'s session profile does not hold the "
                     f"stored key after setup. Run again; if it repeats, run "
@@ -1550,6 +1549,14 @@ class SessionManager:
             "need an update."
         )
 
+    @staticmethod
+    def _keychain_unreadable_error(account_num: str) -> SessionError:
+        return SessionError(
+            f"The macOS Keychain could not be read (locked or busy), "
+            f"so Account-{account_num}'s session profile could not be "
+            f"checked. Unlock the Keychain and run again."
+        )
+
     def _seed_api_key_profile(
         self,
         session_dir: Path,
@@ -1565,7 +1572,11 @@ class SessionManager:
         ``clear_other_axis`` is False while a Claude runs in the profile:
         nothing it depends on is deleted, and its identity is left as it is.
 
-        The config goes first and the key second, so a failure between them
+        The order is: the config splice, then clearing the OAuth login
+        (``.credentials.json`` and its Keychain item; skipped while a Claude is
+        live), then the key. A config that cannot be spliced (unreadable, or
+        locked by a running Claude) therefore leaves the OAuth login in place.
+        Writing the config before the key means a failure between them
         leaves a profile with an identity and no key (state ``"differs"``, seeded
         again on the next launch), never a key with no identity. On macOS the
         key is written only to the Keychain item: Claude Code 2.1.326's own
@@ -1607,7 +1618,7 @@ class SessionManager:
                 raise unreadable
             return loaded
 
-        # Before anything is deleted: a config that cannot be spliced must
+        # Before anything is changed: a config that cannot be spliced must
         # leave the profile as it was. The splice below reads it again under
         # the lock.
         read_profile_config()
@@ -1616,16 +1627,6 @@ class SessionManager:
         if sys.platform != "win32":
             os.chmod(session_dir, 0o700)
         on_macos = Platform.detect() == Platform.MACOS
-
-        if clear_other_axis:
-            (session_dir / ".credentials.json").unlink(missing_ok=True)
-            if on_macos:
-                try:
-                    macos_keychain.delete_password(
-                        keychain_service_name(session_dir), _keychain_account_name()
-                    )
-                except macos_keychain.KEYCHAIN_ERRORS:
-                    pass  # best-effort; the key is checked below
 
         try:
             with proper_lockfile(config_path.parent / (config_path.name + ".lock")):
@@ -1657,6 +1658,16 @@ class SessionManager:
                 f"{config_path} is locked by a running Claude. Run again in a "
                 f"moment."
             ) from None
+
+        if clear_other_axis:
+            (session_dir / ".credentials.json").unlink(missing_ok=True)
+            if on_macos:
+                try:
+                    macos_keychain.delete_password(
+                        keychain_service_name(session_dir), _keychain_account_name()
+                    )
+                except macos_keychain.KEYCHAIN_ERRORS:
+                    pass  # best-effort; the key is checked below
 
         if on_macos:
             try:

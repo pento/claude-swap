@@ -657,6 +657,27 @@ class TestApiKeySeed:
             _setup(mac_manager)
         assert _key_item(block_real_keychain, _profile(mac_manager)) is None
 
+    def test_config_lock_timeout_leaves_the_oauth_login_in_place(
+        self, any_manager, fake_status, block_real_keychain, monkeypatch
+    ):
+        profile = _profile(any_manager)
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text(NEWER_OAUTH)
+        oauth_key = _oauth_item_key(profile)
+        if Platform.detect() == Platform.MACOS:
+            block_real_keychain.data[oauth_key] = NEWER_OAUTH
+
+        def timeout(*a, **k):
+            raise ClaudeCodeLockTimeout("held")
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", timeout)
+        with pytest.raises(SessionError, match="is locked by a running Claude"):
+            _setup(any_manager)
+        assert (profile / ".credentials.json").read_text() == NEWER_OAUTH
+        if Platform.detect() == Platform.MACOS:
+            assert block_real_keychain.data[oauth_key] == NEWER_OAUTH
+            assert _key_item(block_real_keychain, profile) is None
+
     def test_keychain_unreadable_at_state_check_writes_nothing(
         self, mac_manager, fake_status, monkeypatch
     ):
@@ -884,6 +905,30 @@ class TestApiKeyValidation:
         ) as exc:
             _setup(any_manager)
         assert "--debug" in str(exc.value)
+        assert API_KEY not in str(exc.value)
+
+    def test_an_unreadable_keychain_after_setup_is_not_reported_as_a_missing_key(
+        self, mac_manager, fake_status, monkeypatch
+    ):
+        real_get = macos_keychain.get_password
+        key_service = session_mod.managed_key_service_name(_profile(mac_manager))
+        written = []
+        real_set = macos_keychain.set_password
+
+        def tracking_set(*a, **k):
+            written.append(True)
+            return real_set(*a, **k)
+
+        def locked_after_write(service, account, *a, **k):
+            if service == key_service and written:
+                raise macos_keychain.KeychainError("locked")
+            return real_get(service, account, *a, **k)
+
+        monkeypatch.setattr(macos_keychain, "set_password", tracking_set)
+        monkeypatch.setattr(macos_keychain, "get_password", locked_after_write)
+        with pytest.raises(SessionError, match="Keychain could not be read") as exc:
+            _setup(mac_manager)
+        assert "does not hold" not in str(exc.value)
         assert API_KEY not in str(exc.value)
 
     def test_env_key_source_fails_validation(self, any_manager, fake_status):
