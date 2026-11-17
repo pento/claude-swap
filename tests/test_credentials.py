@@ -33,7 +33,7 @@ from claude_swap.credentials import (
     CredentialStore,
 )
 from claude_swap.models import Platform
-from claude_swap.session import keychain_service_name
+from claude_swap.session import keychain_service_name, managed_key_service_name
 
 
 class _Host:
@@ -42,6 +42,7 @@ class _Host:
     def __init__(self, credentials_dir: Path):
         self.platform = Platform.MACOS
         self.credentials_dir = credentials_dir
+        self.backup_dir = credentials_dir.parent
         self.sequence_file = credentials_dir.parent / "sequence.json"
         self._logger = logging.getLogger("test")
 
@@ -661,3 +662,107 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+class TestManagedKeyReadOfASessionProfile:
+    """``_read_managed_key`` reads the hashed managed-key item for cswap's own
+    session profiles only, so ``cswap list`` inside an API-key session shell
+    shows the key rather than "no credentials"."""
+
+    KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
+
+    def _store(self, tmp_path: Path):
+        host = _Host(tmp_path / "backups" / "credentials")
+        return CredentialStore(host), host.backup_dir
+
+    def test_session_profile_reads_its_hashed_managed_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        store, backup_dir = self._store(tmp_path)
+        profile = backup_dir / "sessions" / "2-key"
+        profile.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        seen: list[str] = []
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password",
+            _keychain(
+                {
+                    managed_key_service_name(str(profile)): self.KEY,
+                    CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE: "sk-ant-api03-default",
+                },
+                seen,
+            ),
+        )
+
+        assert store._read_active_credentials().value == self.KEY
+        assert CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE not in seen
+
+    def test_a_custom_dir_outside_the_sessions_is_not_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        store, _ = self._store(tmp_path)
+        custom = tmp_path / "custom"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        seen: list[str] = []
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password",
+            _keychain({managed_key_service_name(str(custom)): self.KEY}, seen),
+        )
+
+        assert store._read_managed_key() == ""
+        assert managed_key_service_name(str(custom)) not in seen
+        assert CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE not in seen
+
+    @pytest.mark.parametrize("value", ["", "/elsewhere"])
+    def test_a_defined_securestorage_dir_is_not_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ):
+        store, backup_dir = self._store(tmp_path)
+        profile = backup_dir / "sessions" / "2-key"
+        profile.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+        seen: list[str] = []
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password",
+            _keychain({managed_key_service_name(str(profile)): self.KEY}, seen),
+        )
+
+        assert store._read_managed_key() == ""
+        assert not any(svc.startswith("Claude Code") for svc in seen)
+
+    def test_unset_config_dir_with_a_non_default_home_does_not_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        store, _ = self._store(tmp_path)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(
+            "claude_swap.credentials._active_profile_is_default", lambda: False
+        )
+        seen: list[str] = []
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password", _keychain({}, seen)
+        )
+
+        assert store._read_managed_key() == ""
+        assert seen == []
+
+    def test_default_profile_still_reads_the_unsuffixed_managed_item(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        store, _ = self._store(tmp_path)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        seen: list[str] = []
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password",
+            _keychain({CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE: self.KEY}, seen),
+        )
+
+        assert store._read_managed_key() == self.KEY
+        assert seen == [CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE]

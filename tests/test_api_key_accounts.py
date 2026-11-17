@@ -867,6 +867,213 @@ class TestApiKeyRun:
 
 
 # ---------------------------------------------------------------------------
+# Switcher: invalidation, drift guard, switch guard, relocation, cleanup
+# ---------------------------------------------------------------------------
+
+NEWER_OAUTH = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-newer",
+            "refreshToken": "sk-ant-ort01-newer",
+            "expiresAt": 9999999999000,
+        }
+    }
+)
+
+
+def _oauth_slot(mgr: SessionManager) -> None:
+    """Add an OAuth setup-token account as slot 1 beside the API-key slot 2."""
+    mgr.switcher.add_account_from_token(SETUP_TOKEN, slot=1)
+
+
+def _oauth_profile(mgr: SessionManager) -> Path:
+    s = mgr.switcher
+    return session_mod.session_dir_for(s.backup_dir, "1", s.account_email("1"))
+
+
+def _stored_credential(mgr: SessionManager) -> str:
+    return mgr.switcher.read_account_credentials("2", _email(mgr))
+
+
+def _plant_login_in_profile(mgr: SessionManager, store) -> Path:
+    """An in-session claude.ai /login: a newer-looking OAuth credential and an
+    `oauthAccount` carrying the slot's own email."""
+    profile = _profile(mgr)
+    (profile / ".credentials.json").write_text(NEWER_OAUTH)
+    if Platform.detect() == Platform.MACOS:
+        store.data[_oauth_item_key(profile)] = NEWER_OAUTH
+    cfg = _profile_config(mgr)
+    cfg["oauthAccount"] = {"emailAddress": _email(mgr), "accountUuid": "u"}
+    (profile / ".claude.json").write_text(json.dumps(cfg))
+    return profile
+
+
+class TestInvalidationOfAnApiKeyProfile:
+    def test_removes_the_key_and_both_items_but_keeps_history(
+        self, mac_manager, fake_status, block_real_keychain
+    ):
+        _setup(mac_manager)
+        profile = _profile(mac_manager)
+        block_real_keychain.data[_oauth_item_key(profile)] = OAUTH_JSON
+        cfg = _profile_config(mac_manager)
+        cfg.update({"primaryApiKey": API_KEY, "projects": {"/x": {}}})
+        (profile / ".claude.json").write_text(json.dumps(cfg))
+
+        mac_manager.switcher._invalidate_session_credentials("2", _email(mac_manager))
+
+        kept = _profile_config(mac_manager)
+        assert "primaryApiKey" not in kept and kept["projects"] == {"/x": {}}
+        assert _key_item(block_real_keychain, profile) is None
+        assert _oauth_item_key(profile) not in block_real_keychain.data
+
+    def test_linux_removes_primary_api_key(self, linux_manager, fake_status):
+        _setup(linux_manager)
+        linux_manager.switcher._invalidate_session_credentials(
+            "2", _email(linux_manager)
+        )
+        assert "primaryApiKey" not in _profile_config(linux_manager)
+        assert session_mod.profile_api_key_state(_profile(linux_manager), API_KEY) == "differs"
+
+    def test_takes_no_config_lock_without_a_primary_api_key(
+        self, mac_manager, fake_status, monkeypatch
+    ):
+        _setup(mac_manager)
+
+        def boom(*a, **k):
+            raise AssertionError("config lock taken")
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", boom)
+        mac_manager.switcher._invalidate_session_credentials("2", _email(mac_manager))
+
+    def test_raises_nothing_when_the_config_is_missing_or_locked(
+        self, linux_manager, fake_status, monkeypatch
+    ):
+        _setup(linux_manager)
+        switcher = linux_manager.switcher
+        profile = _profile(linux_manager)
+
+        def timeout(*a, **k):
+            raise ClaudeCodeLockTimeout("busy")
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", timeout)
+        switcher._invalidate_session_credentials("2", _email(linux_manager))
+        assert _profile_config(linux_manager)["primaryApiKey"] == API_KEY
+
+        (profile / ".claude.json").unlink()
+        switcher._invalidate_session_credentials("2", _email(linux_manager))
+
+
+class TestSessionProfileAheadIgnoresApiKeySlots:
+    def test_an_in_session_login_is_not_a_newer_generation(
+        self, mac_manager, fake_status, block_real_keychain
+    ):
+        _setup(mac_manager)
+        _plant_login_in_profile(mac_manager, block_real_keychain)
+        assert (
+            mac_manager.switcher._session_profile_ahead("2", _email(mac_manager), "")
+            is None
+        )
+
+    @pytest.mark.parametrize("op", ["switch", "swap", "move"])
+    def test_switch_swap_and_move_leave_the_stored_key_alone(
+        self, mac_manager, fake_status, block_real_keychain, op
+    ):
+        _oauth_slot(mac_manager)
+        _setup(mac_manager)
+        _plant_login_in_profile(mac_manager, block_real_keychain)
+        s = mac_manager.switcher
+        email = _email(mac_manager)
+
+        if op == "switch":
+            s.switch_to("2")
+            s.switch_to("1")
+            s.switch_to("2")
+            slot = "2"
+        elif op == "swap":
+            s.swap_accounts("1", "2")
+            slot = "1"
+        else:
+            s.move_account("2", "3")
+            slot = "3"
+
+        assert s.read_account_credentials(slot, email) == API_KEY
+
+
+class TestSwitchGuardForApiKeyTargets:
+    def test_a_live_session_neither_warns_nor_refuses(
+        self, mac_manager, fake_status, capsys
+    ):
+        _setup(mac_manager)
+        _make_live(_profile(mac_manager))
+
+        mac_manager.switcher.switch_to("2")
+
+        assert "go stale" not in capsys.readouterr().out
+
+    def test_an_oauth_slot_with_a_live_session_still_warns(
+        self, mac_manager, fake_status, capsys
+    ):
+        _oauth_slot(mac_manager)
+        profile = _oauth_profile(mac_manager)
+        profile.mkdir(parents=True)
+        _make_live(profile)
+
+        mac_manager.switcher.switch_to("1")
+
+        assert "go stale" in capsys.readouterr().out
+
+
+class TestApiKeyProfilesAreCleanedUp:
+    def test_remove_account_leaves_neither_item(
+        self, mac_manager, fake_status, block_real_keychain
+    ):
+        _setup(mac_manager)
+        profile = _profile(mac_manager)
+        block_real_keychain.data[_oauth_item_key(profile)] = OAUTH_JSON
+
+        mac_manager.switcher.remove_account("2", assume_yes=True)
+
+        assert not profile.exists()
+        assert _key_item(block_real_keychain, profile) is None
+        assert _oauth_item_key(profile) not in block_real_keychain.data
+
+    def test_purge_leaves_neither_item(
+        self, mac_manager, fake_status, block_real_keychain, monkeypatch
+    ):
+        _setup(mac_manager)
+        profile = _profile(mac_manager)
+        block_real_keychain.data[_oauth_item_key(profile)] = OAUTH_JSON
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+
+        mac_manager.switcher.purge()
+
+        assert _key_item(block_real_keychain, profile) is None
+        assert _oauth_item_key(profile) not in block_real_keychain.data
+
+    @pytest.mark.parametrize("op", ["move", "swap"])
+    def test_relocation_clears_the_old_path_and_the_next_setup_seeds_the_new_one(
+        self, mac_manager, fake_status, block_real_keychain, op
+    ):
+        _oauth_slot(mac_manager)
+        _setup(mac_manager)
+        old = _profile(mac_manager)
+        email = _email(mac_manager)
+        s = mac_manager.switcher
+
+        if op == "move":
+            s.move_account("2", "3")
+            new_num = "3"
+        else:
+            s.swap_accounts("1", "2")
+            new_num = "1"
+
+        assert _key_item(block_real_keychain, old) is None
+        new = session_mod.session_dir_for(s.backup_dir, new_num, email)
+        mac_manager.setup_session(new_num, share=False, share_history=False)
+        assert _key_item(block_real_keychain, new) == API_KEY
+
+
+# ---------------------------------------------------------------------------
 # Export / import of raw keys
 # ---------------------------------------------------------------------------
 

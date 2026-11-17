@@ -349,6 +349,8 @@ class _StoreHost(Protocol):
 
     platform: Platform
     credentials_dir: Path
+    # Root of cswap's own store; session profiles live under ``sessions/``.
+    backup_dir: Path
     # The account registry (``sequence.json``): its stat is the "did the
     # account set change?" signal the backup read cache is keyed on.
     sequence_file: Path
@@ -825,28 +827,25 @@ class CredentialStore:
         ``primaryApiKey`` — mirroring Claude Code's
         ``getApiKeyFromConfigOrMacOSKeychain``.
 
-        The Keychain half is default-profile-only. Unlike the OAuth item above
-        this one is gated rather than redirected, because there is no codified
-        derivation to redirect it *to*: ``session.keychain_service_name`` covers
-        the credentials item, and claude's managed-key service name under a
-        custom profile is not pinned anywhere in this repo. Guessing it is the
-        thing the OAuth half can avoid and this half cannot.
-
-        Gating matches what capture already does.
-        ``_read_capture_credentials`` ends on "only this profile's own
-        ``primaryApiKey`` — never the unsuffixed 'Claude Code' Keychain item,
-        which belongs to the default profile and would answer for a login that
-        is not the one being added". Same item, same conclusion; this makes the
-        read side agree with the capture side instead of contradicting it.
+        Which Keychain item to read depends on the profile. Claude Code 2.1.326
+        names it ``Claude Code`` for the default profile and appends
+        ``-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>`` for any other. cswap
+        reads the hashed form only for its own session profiles, where it knows
+        it wrote the item; any other custom profile is not read, so this never
+        answers with a login that is not the active one. Claude Code also
+        replaces that hash input with ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` when
+        it is defined, which is not mirrored here, so the hashed read is
+        skipped then.
 
         ``primaryApiKey`` below is read from the active profile's own config and
         stays, so a custom profile with a managed key is still found.
         """
-        if _active_profile_is_default() and self._use_keychain():
+        service = self._managed_key_service()
+        if service and self._use_keychain():
             try:
                 val = self._kc_call(
                     macos_keychain.get_password,
-                    CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
+                    service,
                     macos_keychain.keychain_account_name(),
                 )
             except macos_keychain.KEYCHAIN_ERRORS as e:
@@ -859,6 +858,22 @@ class CredentialStore:
             key = cfg.get("primaryApiKey")
             if isinstance(key, str) and key:
                 return key
+        return ""
+
+    def _managed_key_service(self) -> str:
+        """Keychain service of the active profile's managed key, or "" for none."""
+        if _active_profile_is_default():
+            return CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
+        raw = os.environ.get("CLAUDE_CONFIG_DIR")
+        if not raw or "CLAUDE_SECURESTORAGE_CONFIG_DIR" in os.environ:
+            return ""
+        try:
+            from claude_swap.session import is_session_profile, managed_key_service_name
+
+            if is_session_profile(raw, self._host.backup_dir):
+                return managed_key_service_name(raw)
+        except Exception:
+            return ""
         return ""
 
     def _read_global_config(self) -> dict | None:
