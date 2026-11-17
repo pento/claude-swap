@@ -24,12 +24,14 @@ from the profile's ``.claude.json``; elsewhere as ``primaryApiKey`` in that
 file. Both also carry the slot's ``oauthAccount``, ``hasCompletedOnboarding``
 and the key's ``customApiKeyResponses.approved`` entry. Unlike the OAuth item,
 cswap writes the managed-key item itself, for three reasons: Claude migrates an
-OAuth seed into its keychain item on first write, but nothing ever migrates a
-key, so a seed would stay in plain text for good on macOS; the item is a bare
+OAuth seed into its keychain item on first write, but nothing in Claude Code
+2.1.326 migrates a key (read from its binary), so a seed would stay in plain
+text for good on macOS; the item is a bare
 key with no format to drift; and a wrong name fails the
 ``claude auth status`` probe before launch rather than at the first prompt.
 When the macOS keychain refuses the item, setup raises and writes no key in
-plain text (Claude Code's own key save does not fall back either).
+plain text (Claude Code 2.1.326's own key save does not fall back either;
+read from its binary).
 
 Before every launch cswap checks that the key Claude would load is the stored
 key (:func:`profile_api_key_state`): on macOS the item must equal it and the
@@ -304,10 +306,11 @@ _AUTH_STATUS_TIMEOUT = 10.0
 # (``"claude.ai"``) while ``apiKeySource`` still says ``"/login managed key"``.
 API_KEY_AUTH_METHOD = "api_key"
 MANAGED_KEY_SOURCE = "/login managed key"
-# Measured on the same build: an ``apiKeyHelper`` setting reports
-# ``authMethod: "api_key_helper"`` with ``apiKeySource: "apiKeyHelper"``; a
-# third-party provider reports ``authMethod: "third_party"``. Both outrank the
-# managed key.
+# Measured on the same build: an ``apiKeyHelper`` setting outranks the managed
+# key and reports ``authMethod: "api_key_helper"`` with
+# ``apiKeySource: "apiKeyHelper"``. Read from the 2.1.326 binary, not measured:
+# a third-party provider reports ``authMethod: "third_party"`` and makes the
+# managed-key lookup return nothing.
 _API_KEY_HELPER_SOURCE = "apiKeyHelper"
 _THIRD_PARTY_AUTH_METHOD = "third_party"
 
@@ -365,9 +368,10 @@ def keychain_service_name(config_dir: Path | str) -> str:
 def managed_key_service_name(config_dir: Path | str) -> str:
     """Keychain service name of the managed API key for this config dir.
 
-    Claude Code 2.1.326 builds both service names from one function: the OAuth
-    item adds ``-credentials``, the managed-key item adds nothing, and both
-    append ``-<digest>`` when a config dir is set. The profile's
+    Claude Code 2.1.326 builds both service names from one function (read
+    from its binary): the OAuth item adds ``-credentials``, the managed-key
+    item adds nothing, and both append ``-<digest>`` when a config dir is set.
+    The profile's
     ``claude auth status --json`` reading the key from this item was measured
     on macOS 27.0 (the key shows as ``/login managed key``).
     """
@@ -410,7 +414,8 @@ def profile_api_key_state(session_dir: Path, key: str) -> str:
     ``"current"``, ``"differs"`` or ``"unknown"``; never raises. Claude Code
     2.1.326 reads the managed key from the profile's Keychain item on macOS and
     falls back to ``primaryApiKey`` in ``<profile>/.claude.json`` on a miss or
-    an error, so on macOS a ``primaryApiKey`` present at all means the profile
+    an error (read from its binary; measured on macOS 27.0: a profile with only
+    ``primaryApiKey`` loads that key), so on macOS a ``primaryApiKey`` present at all means the profile
     is not in the shape cswap writes (the Keychain item is the only copy).
 
     - macOS: ``current`` when the item equals ``key`` and the config has no
@@ -436,7 +441,9 @@ def _read_primary_api_key(session_dir: Path) -> str | None:
     """``primaryApiKey`` from the profile's ``.claude.json``; ``None`` when
     absent, not a string, or the file cannot be read as a JSON object."""
     try:
-        config = json.loads((session_dir / ".claude.json").read_text())
+        config = json.loads(
+            (session_dir / ".claude.json").read_text(encoding="utf-8")
+        )
     except (OSError, ValueError):
         return None
     if not isinstance(config, dict):
@@ -461,7 +468,7 @@ def clear_profile_primary_api_key(session_dir: Path) -> None:
         if config_path.is_symlink() or not config_path.is_file():
             return None
         try:
-            obj = json.loads(config_path.read_text())
+            obj = json.loads(config_path.read_text(encoding="utf-8"))
         except ValueError:
             return None
         if not isinstance(obj, dict) or "primaryApiKey" not in obj:
@@ -489,7 +496,7 @@ def is_session_profile(config_dir: str, backup_dir: Path) -> bool:
         return False
     try:
         Path(config_dir).resolve().relative_to((backup_dir / "sessions").resolve())
-    except (ValueError, OSError):
+    except ValueError:
         return False
     return True
 
@@ -1124,7 +1131,6 @@ class SessionManager:
         same store, not its own profile.
         """
         from claude_swap import oauth as _oauth
-        from claude_swap.credentials import looks_like_api_key
 
         if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
             return False
@@ -1427,7 +1433,8 @@ class SessionManager:
         # Claude would look for the key's Keychain item under that variable's
         # location instead of the profile's. Defined but empty it makes Claude
         # read the default profile's key while the probe still reports the
-        # session's email (Claude Code 2.1.326, measured on macOS 27.0).
+        # session's email (read from the Claude Code 2.1.326 binary, not
+        # measured).
         if "CLAUDE_SECURESTORAGE_CONFIG_DIR" in os.environ:
             raise SessionError(
                 f"CLAUDE_SECURESTORAGE_CONFIG_DIR is set, so Claude Code would "
@@ -1564,7 +1571,8 @@ class SessionManager:
         key is written only to the Keychain item: Claude Code 2.1.326's own
         key save errors rather than fall back to plain text there, and so does
         this. In 2.1.326 nothing migrates a plaintext key into the Keychain
-        later, which is why cswap writes this item itself.
+        later, which is why cswap writes this item itself. (Both read from the
+        2.1.326 binary, not measured.)
         """
         config_text = self.switcher.read_account_config(account_num, email)
         try:

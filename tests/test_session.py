@@ -5710,6 +5710,17 @@ class TestProfileApiKeyStateElsewhere:
     def test_missing_config_differs(self, tmp_path):
         assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "differs"
 
+    def test_non_ascii_config_is_read_as_utf8(self, tmp_path):
+        # Claude Code writes .claude.json as UTF-8; "の" encodes with a byte
+        # (0x81) that a cp1252 locale cannot decode.
+        (tmp_path / ".claude.json").write_bytes(
+            json.dumps(
+                {"primaryApiKey": _PROFILE_KEY, "projects": {"C:/Users/José/の": {}}},
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        assert session_mod.profile_api_key_state(tmp_path, _PROFILE_KEY) == "current"
+
 
 class TestClearProfilePrimaryApiKey:
     def test_removes_only_that_key(self, tmp_path):
@@ -5719,6 +5730,18 @@ class TestClearProfilePrimaryApiKey:
         )
         session_mod.clear_profile_primary_api_key(tmp_path)
         assert json.loads(path.read_text()) == {"theme": "dark", "n": {"a": 1}}
+
+    def test_keeps_non_ascii_content_intact(self, tmp_path):
+        projects = {"C:/Users/José/の": {"allowedTools": []}}
+        path = tmp_path / ".claude.json"
+        path.write_bytes(
+            json.dumps(
+                {"primaryApiKey": _PROFILE_KEY, "projects": projects},
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        session_mod.clear_profile_primary_api_key(tmp_path)
+        assert json.loads(path.read_text(encoding="utf-8")) == {"projects": projects}
 
     def test_no_lock_when_key_absent(self, tmp_path, monkeypatch):
         path = _write_profile_config(tmp_path, {"theme": "dark"})

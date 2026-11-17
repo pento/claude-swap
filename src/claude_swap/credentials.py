@@ -829,12 +829,13 @@ class CredentialStore:
 
         Which Keychain item to read depends on the profile. Claude Code 2.1.326
         names it ``Claude Code`` for the default profile and appends
-        ``-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>`` for any other. cswap
+        ``-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>`` for any other (read
+        from its binary; the hashed item was measured on macOS 27.0). cswap
         reads the hashed form only for its own session profiles, where it knows
         it wrote the item; any other custom profile is not read, so this never
         answers with a login that is not the active one. Claude Code also
         replaces that hash input with ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` when
-        it is defined, which is not mirrored here, so the hashed read is
+        it is defined (read, not measured), which is not mirrored here, so the hashed read is
         skipped then.
 
         ``primaryApiKey`` below is read from the active profile's own config and
