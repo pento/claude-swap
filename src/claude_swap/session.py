@@ -1427,7 +1427,7 @@ class SessionManager:
         # Claude would look for the key's Keychain item under that variable's
         # location instead of the profile's. Defined but empty it makes Claude
         # read the default profile's key while the probe still reports the
-        # session's email.
+        # session's email (Claude Code 2.1.326, measured on macOS 27.0).
         if "CLAUDE_SECURESTORAGE_CONFIG_DIR" in os.environ:
             raise SessionError(
                 f"CLAUDE_SECURESTORAGE_CONFIG_DIR is set, so Claude Code would "
@@ -1563,8 +1563,8 @@ class SessionManager:
         again on the next launch), never a key with no identity. On macOS the
         key is written only to the Keychain item: Claude Code 2.1.326's own
         key save errors rather than fall back to plain text there, and so does
-        this. Nothing migrates a plaintext key into the Keychain later, which
-        is why cswap writes this item itself.
+        this. In 2.1.326 nothing migrates a plaintext key into the Keychain
+        later, which is why cswap writes this item itself.
         """
         config_text = self.switcher.read_account_config(account_num, email)
         try:
@@ -1576,6 +1576,33 @@ class SessionManager:
         )
         if not oauth_account:
             raise self._no_stored_key_error(account_num)
+
+        config_path = session_dir / ".claude.json"
+        unreadable = SessionError(
+            f"{config_path} could not be read, so Account-{account_num}'s "
+            f"session profile was not changed. Move the file aside and run "
+            f"again."
+        )
+
+        def read_profile_config() -> dict:
+            if config_path.is_symlink():
+                raise unreadable
+            if not config_path.exists():
+                return {}
+            if not config_path.is_file():
+                raise unreadable
+            try:
+                loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                raise unreadable from None
+            if not isinstance(loaded, dict):
+                raise unreadable
+            return loaded
+
+        # Before anything is deleted: a config that cannot be spliced must
+        # leave the profile as it was. The splice below reads it again under
+        # the lock.
+        read_profile_config()
 
         session_dir.mkdir(parents=True, exist_ok=True)
         if sys.platform != "win32":
@@ -1592,27 +1619,9 @@ class SessionManager:
                 except macos_keychain.KEYCHAIN_ERRORS:
                     pass  # best-effort; the key is checked below
 
-        config_path = session_dir / ".claude.json"
-        unreadable = SessionError(
-            f"{config_path} could not be read, so Account-{account_num}'s "
-            f"session profile was not changed. Move the file aside and run "
-            f"again."
-        )
         try:
             with proper_lockfile(config_path.parent / (config_path.name + ".lock")):
-                obj: dict = {}
-                if config_path.is_symlink():
-                    raise unreadable
-                if config_path.exists():
-                    if not config_path.is_file():
-                        raise unreadable
-                    try:
-                        loaded = json.loads(config_path.read_text(encoding="utf-8"))
-                    except (ValueError, OSError):
-                        raise unreadable from None
-                    if not isinstance(loaded, dict):
-                        raise unreadable
-                    obj = loaded
+                obj = read_profile_config()
 
                 responses = obj.get("customApiKeyResponses")
                 if not isinstance(responses, dict):
@@ -1801,7 +1810,8 @@ class SessionManager:
         27.0): ``authMethod`` is :data:`API_KEY_AUTH_METHOD` and
         ``apiKeySource`` is :data:`MANAGED_KEY_SOURCE`. ``email`` may be
         absent from the status (Claude omits it when the profile also holds an
-        emptied OAuth login); present, it must match. What the probe reported
+        emptied OAuth login; read from the 2.1.326 binary, not measured);
+        present, it must match. What the probe reported
         is kept in ``self._last_probe`` for the caller's failure message.
         """
         self._last_probe = None

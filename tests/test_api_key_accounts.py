@@ -13,6 +13,7 @@ import logging
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -375,6 +376,7 @@ class _ProbeState:
         self.email_override: str | None = None
         self.raises: Exception | None = None
         self.force_logged_out = False
+        self.key_source: str | None = None
 
 
 @pytest.fixture
@@ -421,7 +423,7 @@ def fake_status(monkeypatch, block_real_keychain):
             payload = {
                 "loggedIn": True,
                 "authMethod": "api_key",
-                "apiKeySource": "/login managed key",
+                "apiKeySource": state.key_source or "/login managed key",
                 "email": email,
             }
         else:
@@ -537,8 +539,8 @@ class TestApiKeySeed:
         caplog.set_level(logging.DEBUG)
         real_set = macos_keychain.set_password
 
-        def locked(*a, **k):
-            raise macos_keychain.KeychainError("locked")
+        def locked(service, account, value, *a, **k):
+            raise macos_keychain.KeychainError(f"refused {value}")
 
         monkeypatch.setattr(macos_keychain, "set_password", locked)
         with pytest.raises(SessionError, match="did not accept Account-2's API key") as exc:
@@ -549,7 +551,8 @@ class TestApiKeySeed:
         assert _key_item(block_real_keychain, profile) is None
         assert profile.is_dir()
         out = capsys.readouterr()
-        assert API_KEY not in out.out + out.err + caplog.text + str(exc.value)
+        trace = "".join(traceback.format_exception(exc.value))
+        assert API_KEY not in out.out + out.err + caplog.text + str(exc.value) + trace
         assert API_KEY not in (profile / ".claude.json").read_text()
 
         monkeypatch.setattr(macos_keychain, "set_password", real_set)
@@ -596,10 +599,52 @@ class TestApiKeySeed:
         profile = _profile(any_manager)
         profile.mkdir(parents=True)
         (profile / ".claude.json").write_bytes(b"{not json")
+        (profile / ".credentials.json").write_text(OAUTH_JSON)
+        block_real_keychain.data[_oauth_item_key(profile)] = OAUTH_JSON
         with pytest.raises(SessionError, match="could not be read"):
             _setup(any_manager)
         assert (profile / ".claude.json").read_bytes() == b"{not json"
+        assert (profile / ".credentials.json").read_text() == OAUTH_JSON
+        assert block_real_keychain.data[_oauth_item_key(profile)] == OAUTH_JSON
         assert _key_item(block_real_keychain, profile) is None
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges")
+    def test_symlinked_config_is_refused_and_untouched(
+        self, any_manager, fake_status, tmp_path
+    ):
+        profile = _profile(any_manager)
+        profile.mkdir(parents=True)
+        target = tmp_path / "elsewhere.json"
+        target.write_text("{}")
+        (profile / ".claude.json").symlink_to(target)
+        (profile / ".credentials.json").write_text(OAUTH_JSON)
+        with pytest.raises(SessionError, match="could not be read"):
+            _setup(any_manager)
+        assert target.read_text() == "{}"
+        assert (profile / ".credentials.json").exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+    def test_profile_directory_is_made_private(self, any_manager, fake_status):
+        profile = _profile(any_manager)
+        profile.mkdir(parents=True)
+        os.chmod(profile, 0o755)
+        _setup(any_manager)
+        assert profile.stat().st_mode & 0o777 == 0o700
+
+    def test_windows_seed_writes_primary_api_key_without_the_keychain(
+        self, temp_home, monkeypatch, fake_status
+    ):
+        mgr = _api_manager(monkeypatch, Platform.WINDOWS)
+
+        def boom(*a, **k):
+            raise AssertionError("Keychain touched off macOS")
+
+        for name in ("get_password", "set_password", "delete_password"):
+            monkeypatch.setattr(macos_keychain, name, boom)
+        _setup(mgr)
+        cfg = _profile_config(mgr)
+        assert cfg["primaryApiKey"] == API_KEY
+        assert approved_form(API_KEY) in cfg["customApiKeyResponses"]["approved"]
 
     def test_config_lock_timeout_raises_and_leaves_no_item(
         self, mac_manager, fake_status, block_real_keychain, monkeypatch
@@ -818,6 +863,36 @@ class TestApiKeyValidation:
         _setup(any_manager)
         self._assert_left_in_place(any_manager)
 
+    def test_probe_timeout_with_drifted_identity_raises_and_leaves_the_profile(
+        self, any_manager, fake_status, monkeypatch
+    ):
+        fake_status.raises = subprocess.TimeoutExpired("claude", 10)
+        monkeypatch.setattr(session_mod, "session_identity_drifted", lambda *a: True)
+        with pytest.raises(SessionError, match="could not be verified") as exc:
+            _setup(any_manager)
+        assert "profile is left in place" in str(exc.value)
+        self._assert_left_in_place(any_manager)
+
+    def test_a_profile_that_does_not_hold_the_key_after_setup_is_refused(
+        self, any_manager, fake_status, monkeypatch
+    ):
+        monkeypatch.setattr(
+            SessionManager, "_seed_api_key_profile", lambda *a, **k: None
+        )
+        with pytest.raises(
+            SessionError, match="does not hold the stored key after setup"
+        ) as exc:
+            _setup(any_manager)
+        assert "--debug" in str(exc.value)
+        assert API_KEY not in str(exc.value)
+
+    def test_env_key_source_fails_validation(self, any_manager, fake_status):
+        fake_status.key_source = "ANTHROPIC_API_KEY"
+        with pytest.raises(SessionError, match="failed validation") as exc:
+            _setup(any_manager)
+        assert "apiKeySource=ANTHROPIC_API_KEY" in str(exc.value)
+        self._assert_left_in_place(any_manager)
+
     def test_unspawnable_claude_raises_and_leaves_the_profile(
         self, any_manager, fake_status
     ):
@@ -844,6 +919,7 @@ class TestApiKeyRun:
             "_get_current_account",
             lambda: (_email(any_manager), ""),
         )
+        monkeypatch.setattr(any_manager, "_default_login_signed_out", lambda: False)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-from-the-env")
         with pytest.raises(_ExecCalled) as exc:
             any_manager.run("2", [], share=False, share_history=False, require_session=True)
