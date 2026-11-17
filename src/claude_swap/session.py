@@ -8,12 +8,42 @@ untouched. ``CLAUDE_CONFIG_DIR`` fully isolates Claude Code's config and
 credential lookup; on macOS, Claude hashes the (NFC-normalized) env var value
 into its keychain service name, so each profile gets its own keychain entry.
 
-Profiles are seeded with a plaintext ``.credentials.json`` — deliberate,
+OAuth profiles are seeded with a plaintext ``.credentials.json`` — deliberate,
 including on macOS: the plaintext fallback is Claude's only credential
 mechanism on Linux (a stable contract), and Claude migrates it into its
-hashed keychain entry on first write. Writing that keychain entry ourselves
-would couple us to Claude's internal storage format and naming, where a
-mismatch is a hard "logged out" failure instead of a harmless stale entry.
+hashed keychain entry on first write. Writing that OAuth keychain entry
+ourselves would couple us to Claude's internal storage format and naming,
+where a mismatch is a hard "logged out" failure instead of a harmless stale
+entry. cswap only reads and deletes that item.
+
+API-key accounts also get their own profile, always (a static key cannot
+drift, so there is no same-account shortcut to the default login). The key
+lives where Claude Code 2.1.326 looks for a managed key: on macOS only in the
+profile's ``Claude Code-<hash>`` keychain item, with ``primaryApiKey`` absent
+from the profile's ``.claude.json``; elsewhere as ``primaryApiKey`` in that
+file. Both also carry the slot's ``oauthAccount``, ``hasCompletedOnboarding``
+and the key's ``customApiKeyResponses.approved`` entry. Unlike the OAuth item,
+cswap writes the managed-key item itself, for three reasons: Claude migrates an
+OAuth seed into its keychain item on first write, but nothing ever migrates a
+key, so a seed would stay in plain text for good on macOS; the item is a bare
+key with no format to drift; and a wrong name fails the
+``claude auth status`` probe before launch rather than at the first prompt.
+When the macOS keychain refuses the item, setup raises and writes no key in
+plain text (Claude Code's own key save does not fall back either).
+
+Before every launch cswap checks that the key Claude would load is the stored
+key (:func:`profile_api_key_state`): on macOS the item must equal it and the
+config hold no ``primaryApiKey`` (which Claude reads when the item is missing,
+so a stray one could serve a different key); elsewhere ``primaryApiKey`` must
+equal it. A mismatch reseeds the profile. A re-key while a Claude is running
+in the profile updates the key in place and deletes nothing that Claude
+depends on; the running sessions keep their old key until they restart.
+Because a saved claude.ai login outranks the managed key in
+``claude auth status`` (Claude Code 2.1.326, measured on macOS 27.0), a seed
+with nothing live removes the profile's OAuth credential and item. Validation
+failures never delete an API-key profile, since the usual causes (an
+``apiKeyHelper`` setting, a provider override) are environmental and the
+directory holds the account's history.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
 ``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
@@ -472,9 +502,10 @@ def read_session_credentials(session_dir: Path) -> str | None:
     in place, and nothing syncs them back to backup. On macOS the rotated
     credential lives in the profile's hashed keychain entry (which shadows
     the plaintext seed from the moment claude first writes it), elsewhere in
-    the profile's ``.credentials.json``. Read-only by design: writing either
-    location stays claude's job (see the module docstring on why cswap never
-    writes the hashed entry). Returns ``None`` when the profile has no
+    the profile's ``.credentials.json``. Read-only by design: writing the OAuth
+    location stays claude's job (see the module docstring on why cswap leaves
+    that hashed entry alone; the managed API-key item is the one it writes).
+    Returns ``None`` when the profile has no
     readable credential material.
     """
     return read_config_dir_credentials(str(session_dir))

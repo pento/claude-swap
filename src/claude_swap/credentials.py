@@ -938,9 +938,9 @@ class CredentialStore:
         alone. With ``CLAUDE_CONFIG_DIR`` naming the default profile it is the
         login of a claude started without the variable, which the switch's
         outgoing backup never read, and the active read takes the file and a
-        managed key ahead of it. Deleting a hashed item is sanctioned where
-        authoring one is not: ``session.delete_macos_keychain_entry`` retires
-        one before every reseed, for this same reason.
+        managed key ahead of it. Deleting a hashed OAuth item is sanctioned
+        where authoring one is not: ``session.delete_macos_keychain_entry``
+        retires one before every reseed, for this same reason.
 
         Returns whether no active item can shadow the file. ``delete_password``
         returns only on rc 0 or rc 44 (already absent) and raises otherwise, so
@@ -1140,9 +1140,9 @@ class CredentialStore:
         recording backend ``"file"``. Linux/WSL/Windows always write the file.
 
         A custom profile takes that same file path deliberately, not as a
-        fallback (#206): its Keychain item is one cswap must not author — see
-        ``session``'s module docstring on why writing claude's hashed format is
-        a hard "logged out" failure when it drifts — so the switch retires the
+        fallback (#206): its OAuth Keychain item is one cswap must not author —
+        see ``session``'s module docstring on why writing claude's hashed
+        format is a hard "logged out" failure when it drifts — so the switch retires the
         stale item and seeds ``.credentials.json``, exactly as session profiles
         are seeded, and lets claude migrate it on its first write. That route
         does not pin file mode once the stale item is verifiably gone: nothing

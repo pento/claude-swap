@@ -803,8 +803,9 @@ class ClaudeAccountSwitcher:
         profile's possibly-stale plaintext seed — and rather than reaching the
         fallbacks below, which belong to other stores entirely.
 
-        Read-only. cswap does not write claude's hashed keychain entry — see
-        the ``session`` module docstring for why.
+        Read-only. cswap does not write claude's hashed OAuth keychain entry —
+        see the ``session`` module docstring for why (it writes only a session
+        profile's managed API-key item).
         """
         from claude_swap.session import read_config_dir_credentials
 
