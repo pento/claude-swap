@@ -408,6 +408,53 @@ class TestFetchUsage:
         assert fable["countdown"] == "3h 0m"
         assert "clock" in fable
 
+    def _shares_result(self, shares, limits=None):
+        if limits is None:
+            limits = [
+                {"kind": "session", "percent": 7, "scope": None},
+                {"kind": "weekly_all", "percent": 72, "scope": None},
+                {"kind": "weekly_scoped", "percent": 24,
+                 "scope": {"model": {"id": None, "display_name": "Fable"}}},
+            ]
+        return oauth.build_usage_result({
+            "seven_day": {"utilization": 72.0, "resets_at": None},
+            "limits": limits,
+            "weekly_scoped_shares": shares,
+        })
+
+    def test_scoped_share_attached_by_limit_index(self):
+        result = self._shares_result([{
+            "limit_index": 2, "used_percent_of_weekly": 12,
+            "allowance_percent_of_weekly": 50,
+        }])
+        assert result["scoped"][0]["share_of_weekly"] == {"used": 12, "allowance": 50}
+
+    @pytest.mark.parametrize("row", [
+        {"limit_index": 1, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": 50},
+        {"limit_index": 9, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": 50},
+        {"limit_index": -1, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": 50},
+        {"limit_index": True, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": 50},
+        {"limit_index": 2, "used_percent_of_weekly": 120, "allowance_percent_of_weekly": 50},
+        {"limit_index": 2, "used_percent_of_weekly": "12", "allowance_percent_of_weekly": 50},
+        {"limit_index": 2, "used_percent_of_weekly": 12},
+        {"limit_index": 2, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": 120},
+        {"limit_index": 2, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": -1},
+        {"limit_index": 2, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": "50"},
+        {"limit_index": 2, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": None},
+        {"limit_index": 2, "used_percent_of_weekly": 10 ** 400, "allowance_percent_of_weekly": 50},
+        {"limit_index": 2, "used_percent_of_weekly": float("nan"), "allowance_percent_of_weekly": 50},
+        {"limit_index": 2, "used_percent_of_weekly": 12, "allowance_percent_of_weekly": float("inf")},
+        "nope",
+    ])
+    def test_malformed_scoped_share_is_ignored(self, row):
+        result = self._shares_result([row])
+        assert result["scoped"][0]["pct"] == 24.0
+        assert "share_of_weekly" not in result["scoped"][0]
+
+    def test_non_list_scoped_shares_is_ignored(self):
+        result = self._shares_result({"limit_index": 2})
+        assert "share_of_weekly" not in result["scoped"][0]
+
     def test_no_limits_no_scoped_key(self):
         """A response without a limits array yields no 'scoped' key (backward compat)."""
         result = self._fetch_with_response({

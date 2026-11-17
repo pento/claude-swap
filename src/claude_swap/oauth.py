@@ -1061,6 +1061,55 @@ def _log_usage_failure(
 
 
 
+def valid_share_of_weekly(share: object) -> dict | None:
+    """``{"used": n, "allowance": n}`` when both are finite numbers in 0..100
+    (bools excluded), else None. Both are percentages of the weekly (7d)
+    limit: what the model has used of it, and the slice of it the model may
+    use."""
+    if not isinstance(share, dict):
+        return None
+    out = {}
+    for key in ("used", "allowance"):
+        v = share.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        # The range test alone also refuses NaN and infinities; isfinite()
+        # would raise OverflowError on an int too large for a float.
+        if not 0 <= v <= 100:
+            return None
+        out[key] = v
+    return out
+
+
+def _scoped_shares(data: dict, limits: list) -> dict[int, dict]:
+    """``limits`` index → ``share_of_weekly`` from the usage API's top-level
+    ``weekly_scoped_shares``: ``[{"limit_index", "used_percent_of_weekly",
+    "allowance_percent_of_weekly"}]``, where ``limit_index`` points at a
+    ``weekly_scoped`` entry of ``limits`` (measured on a Team account,
+    2026-11-17: Fable used 12 of an allowance of 50). A malformed row, an
+    index out of range or not at a ``weekly_scoped`` entry is skipped."""
+    rows = data.get("weekly_scoped_shares")
+    if not isinstance(rows, list):
+        return {}
+    out: dict[int, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        idx = row.get("limit_index")
+        if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < len(limits):
+            continue
+        target = limits[idx]
+        if not isinstance(target, dict) or target.get("kind") != "weekly_scoped":
+            continue
+        share = valid_share_of_weekly({
+            "used": row.get("used_percent_of_weekly"),
+            "allowance": row.get("allowance_percent_of_weekly"),
+        })
+        if share is not None:
+            out[idx] = share
+    return out
+
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI.
 
@@ -1111,7 +1160,8 @@ def build_usage_result(data: dict) -> dict | None:
     limits = data.get("limits")
     if isinstance(limits, list):
         scoped: list[dict] = []
-        for lim in limits:
+        shares = _scoped_shares(data, limits)
+        for i, lim in enumerate(limits):
             if not isinstance(lim, dict):
                 continue
             scope = lim.get("scope")
@@ -1127,6 +1177,9 @@ def build_usage_result(data: dict) -> dict | None:
             if isinstance(lim.get("probe_after"), str):
                 # Only the header probe sets it (see _scoped_limit_from_headers).
                 scoped_entry["probe_after"] = lim["probe_after"]
+            if i in shares:
+                # The header probe has no such data: those rows lack the key.
+                scoped_entry["share_of_weekly"] = shares[i]
             scoped.append(scoped_entry)
         if scoped:
             result["scoped"] = scoped

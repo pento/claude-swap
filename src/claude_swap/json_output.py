@@ -102,11 +102,16 @@ def _scoped_window_to_json(entry: dict, fetched_at: float | None) -> dict:
     ``probeAfter`` marks a row the header probe read as spent and keeps
     until then instead of asking again (``oauth._add_scoped_limits``). It
     survives export so a machine importing the reading keeps it too.
+    ``shareOfWeekly`` (``used``/``allowance``, percent of the weekly limit)
+    is the usage API's per-model share; absent on a header-probe reading.
     """
     out = _weekly_window_to_json(entry, fetched_at)
     out["name"] = entry["name"]
     if "probe_after" in entry:
         out["probeAfter"] = entry["probe_after"]
+    share = oauth.valid_share_of_weekly(entry.get("share_of_weekly"))
+    if share is not None:
+        out["shareOfWeekly"] = share
     return out
 
 
@@ -194,14 +199,16 @@ def usage_from_json(usage: object) -> dict:
     """Read a ``usage`` object from ``list --json`` back into the internal dict.
 
     The inverse of :func:`usage_to_json` for what the API measured: ``pct``,
-    ``resetsAt``, the spend amounts and the scoped model names. Everything
+    ``resetsAt``, the spend amounts, the scoped model names and each scoped
+    window's ``shareOfWeekly``. Everything
     derived at serialization (countdown, clock, pace fields) is dropped, and
     the fetch-time strings are rebuilt from ``resets_at``, which gives the
     shape :func:`oauth.build_usage_result` stores. A 5h/7d window's ``pct``
     may be ``null`` (reported without a figure), except in a ``source:
     headers`` document, which the probe never produces that way. Raises
     ``ValueError`` on anything malformed, so an importer can refuse a
-    document before writing any of it.
+    document before writing any of it. The one exception is a malformed
+    ``shareOfWeekly``: it is optional, so it is dropped, not refused.
     """
     if not isinstance(usage, dict):
         raise ValueError("usage must be an object")
@@ -240,6 +247,9 @@ def usage_from_json(usage: object) -> dict:
                 if not isinstance(probe_after, str) or parse_reset_ts(probe_after) is None:
                     raise ValueError(f"{label}.probeAfter must be an ISO-8601 time")
                 entry["probe_after"] = probe_after
+            share = oauth.valid_share_of_weekly(window.get("shareOfWeekly"))
+            if share is not None:
+                entry["share_of_weekly"] = share
             scoped.append({"name": name, **entry})
         out["scoped"] = scoped
     if "rejected" in usage:
@@ -261,6 +271,9 @@ def usage_from_json(usage: object) -> dict:
         for key, label in (("five_hour", "fiveHour"), ("seven_day", "sevenDay")):
             if key in out and out[key]["pct"] is None:
                 raise ValueError(f"{label}.pct cannot be null in a headers reading")
+        # The header probe has no per-model share, so one here is dropped.
+        for entry in out.get("scoped", ()):
+            entry.pop("share_of_weekly", None)
         out["source"] = oauth.USAGE_SOURCE_HEADERS
     return out
 
