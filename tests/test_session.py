@@ -1775,6 +1775,127 @@ class TestRun:
         # Plain claude behavior: API key is NOT scrubbed (unlike session mode).
         assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
 
+    # -- the launch declaration (CSWAP_LAUNCH) --------------------------------
+
+    @staticmethod
+    def _declared(env):
+        return json.loads(env["CSWAP_LAUNCH"])
+
+    def test_session_path_declares_launch(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(session_mod, "_launch_prog", lambda: "cswap")
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", ["--resume", "x"])
+
+        # Compact JSON, the account as its email, no flags the user didn't give.
+        assert exc.value.env["CSWAP_LAUNCH"] == json.dumps(
+            {
+                "v": 1,
+                "argv": ["cswap", "run", ACCOUNT_EMAIL, "--"],
+                "pid": os.getpid(),
+            },
+            separators=(",", ":"),
+        )
+
+    def test_declared_flags_are_rebuilt_from_the_choices(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(session_mod, "_launch_prog", lambda: "cswap")
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run(
+                "2", [], share=False, share_history=False, require_session=True
+            )
+        assert self._declared(exc.value.env)["argv"] == [
+            "cswap", "run", ACCOUNT_EMAIL,
+            "--no-share", "--no-share-history", "--require-session", "--",
+        ]
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [], share_history=True)
+        assert self._declared(exc.value.env)["argv"] == [
+            "cswap", "run", ACCOUNT_EMAIL, "--share-history", "--",
+        ]
+
+    @pytest.mark.parametrize(
+        "email", ["o'brien@example.com", ACCOUNT_EMAIL + "\n"]
+    )
+    def test_declared_account_is_the_slot_when_the_email_has_odd_characters(
+        self, manager, monkeypatch, email
+    ):
+        monkeypatch.setattr(session_mod, "_launch_prog", lambda: "cswap")
+        # An email the word rule rejects (a quote, or a trailing newline a
+        # shell would run as the end of the command), so the slot number goes.
+        words = manager._launch_words("2", email, True, None, False)
+        assert words == ["cswap", "run", "2", "--"]
+
+    def test_a_word_with_a_trailing_newline_is_never_exported(self):
+        env = {"CSWAP_LAUNCH": "inherited"}
+        SessionManager._declare_launch(env, ["cswap", "run", "2\n", "--"])
+        assert "CSWAP_LAUNCH" not in env
+
+    def test_declared_account_is_the_slot_when_the_email_leads_elsewhere(
+        self, manager, monkeypatch
+    ):
+        monkeypatch.setattr(session_mod, "_launch_prog", lambda: "cswap")
+        monkeypatch.setattr(
+            manager.switcher, "resolve_account", lambda ident: ("3", "x", "")
+        )
+        assert manager._launch_words("2", ACCOUNT_EMAIL, True, None, False) == [
+            "cswap", "run", "2", "--",
+        ]
+
+    def test_fast_path_declares_launch(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.setattr(session_mod, "_launch_prog", lambda: "cswap")
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert self._declared(exc.value.env) == {
+            "v": 1,
+            "argv": ["cswap", "run", ACCOUNT_EMAIL, "--"],
+            "pid": os.getpid(),
+        }
+
+    def test_exec_default_declares_a_bare_run(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.setattr(session_mod, "_launch_prog", lambda: "cswap")
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default([])
+        assert self._declared(exc.value.env)["argv"] == ["cswap", "run", "--"]
+
+    def test_inherited_declaration_is_overwritten(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(session_mod, "_launch_prog", lambda: "cswap")
+        monkeypatch.setenv("CSWAP_LAUNCH", '{"v":1,"argv":["cswap","run","9","--"],"pid":1}')
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+        declared = self._declared(exc.value.env)
+        assert declared["argv"][2] == ACCOUNT_EMAIL
+        assert declared["pid"] == os.getpid()
+
+    def test_inherited_declaration_is_removed_when_nothing_can_be_exported(
+        self, manager, capture_exec, monkeypatch
+    ):
+        # A program name the word rule rejects leaves nothing safe to export.
+        monkeypatch.setattr(session_mod, "_launch_prog", lambda: "my cswap")
+        monkeypatch.setenv("CSWAP_LAUNCH", '{"v":1,"argv":["cswap","run","9","--"],"pid":1}')
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default([])
+        assert "CSWAP_LAUNCH" not in exc.value.env
+
     def test_exec_default_claude_not_on_path(self, manager, monkeypatch):
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
         with pytest.raises(SessionError, match="not found on PATH"):

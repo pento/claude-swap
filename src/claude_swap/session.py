@@ -43,6 +43,27 @@ Junctions are not symlinks to the stdlib: ``is_symlink()`` is False for one,
 link cswap made" is therefore ``fsutil.is_link``, and the merge walks a
 profile's history with its own eyes (``_history_tree``).
 
+Launch declaration: every ``cswap run`` launch exports ``CSWAP_LAUNCH`` in the
+environment it gives Claude, so a supervisor that later has to restart that
+Claude can relaunch it the same way. The value is compact JSON,
+``{"v":1,"argv":[...,"--"],"pid":<pid>}``, where ``argv`` is the words that
+reproduce the launch up to the point where Claude's own arguments begin:
+``[<prog>, "run", <account>, <flags...>, "--"]``. ``<account>`` is the
+account's email when that resolves back to the same slot (a slot number goes
+stale after ``cswap swap`` or ``move``) and the slot number otherwise; the
+flags are rebuilt from the parsed choices, never copied from the command line
+(``--no-share``, ``--share-history`` / ``--no-share-history`` only when asked,
+``--require-session``; ``--debug`` is dropped). Every word is limited to
+``[A-Za-z0-9@%+=:,./_-]`` so it can be typed into a shell unquoted; an email
+outside that set falls back to the slot number. ``pid`` is this process's: on
+POSIX the exec makes it Claude's pid, and the variable is inherited by every
+nested process, so a reader compares it with the pid it is looking at. On
+Windows cswap stays resident as a wrapper, so ``pid`` is cswap's, never
+Claude's, and a reader that compares pids ignores the value there. A nested
+``cswap run`` overwrites the outer value, and a launch with nothing to export
+removes an inherited one. ``_declare_launch`` sets it just before each of the
+three exec sites.
+
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
 """
@@ -52,6 +73,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -65,6 +87,7 @@ from claude_swap import macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
+    ClaudeSwitchError,
     CredentialReadError,
     LockError,
     SessionError,
@@ -246,6 +269,22 @@ def mark_session_stale(session_dir: Path) -> bool:
         return True
     except OSError:
         return False
+
+
+# The launch declaration (see the module docstring). A word outside this set
+# could not be typed into a shell unquoted, so it is never exported.
+LAUNCH_ENV = "CSWAP_LAUNCH"
+# ``fullmatch``, never ``match`` with ``$``: ``$`` also matches before a
+# trailing newline, which a shell would run as the end of the command.
+_LAUNCH_WORD = re.compile(r"[A-Za-z0-9@%+=:,./_-]{1,256}")
+
+
+def _launch_prog() -> str:
+    """The command name to relaunch with: the bare name the user typed."""
+    from claude_swap.cli import _prog_name  # cli imports this module
+
+    return _prog_name()
+
 
 # Env vars that make claude bypass account OAuth entirely (verified against
 # claude 2.1.175). Dropped from the auth-status probe (they'd fake "logged in"
@@ -841,6 +880,12 @@ class SessionManager:
             env = dict(os.environ)
             # Run on the default login, not on the preset profile.
             env.pop("CLAUDE_CONFIG_DIR", None)
+            self._declare_launch(
+                env,
+                self._launch_words(
+                    account_num, email, share, requested_history, require_session
+                ),
+            )
             self._exec(claude_bin, claude_args, env=env)
         if config_dir_preset:
             warning(
@@ -867,6 +912,12 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        self._declare_launch(
+            env,
+            self._launch_words(
+                account_num, email, share, requested_history, require_session
+            ),
+        )
         self._exec(claude_bin, claude_args, env=env)
 
     def _history_on_the_fast_path(
@@ -1003,7 +1054,57 @@ class SessionManager:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        self._exec(claude_bin, claude_args, env=dict(os.environ))
+        env = dict(os.environ)
+        self._declare_launch(env, [_launch_prog(), "run", "--"])
+        self._exec(claude_bin, claude_args, env=env)
+
+    def _launch_words(
+        self,
+        account_num: str,
+        email: str,
+        share: bool,
+        share_history: bool | None,
+        require_session: bool,
+    ) -> list[str]:
+        """The words that relaunch this ``cswap run``, ending in ``--``.
+
+        ``share_history`` is the launch's own request (``None`` when neither
+        flag was given), so the words never turn a default into a choice.
+        """
+        account = account_num
+        if _LAUNCH_WORD.fullmatch(email or ""):
+            try:
+                if self.switcher.resolve_account(email)[0] == account_num:
+                    account = email
+            except ClaudeSwitchError:
+                pass
+        words = [_launch_prog(), "run", str(account)]
+        if not share:
+            words.append("--no-share")
+        if share_history is True:
+            words.append("--share-history")
+        elif share_history is False:
+            words.append("--no-share-history")
+        if require_session:
+            words.append("--require-session")
+        words.append("--")
+        return words
+
+    @staticmethod
+    def _declare_launch(env: dict[str, str], words: list[str] | None) -> None:
+        """Put ``CSWAP_LAUNCH`` on ``env``, or drop an inherited one.
+
+        Every word must pass ``_LAUNCH_WORD``; otherwise there is nothing
+        safe to export and the variable is removed, so a nested launch never
+        leaves its parent's words on a process they don't describe.
+        """
+        if words and all(_LAUNCH_WORD.fullmatch(w) for w in words):
+            env[LAUNCH_ENV] = json.dumps(
+                {"v": 1, "argv": words, "pid": os.getpid()},
+                separators=(",", ":"),
+            )
+        else:
+            env.pop(LAUNCH_ENV, None)
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
