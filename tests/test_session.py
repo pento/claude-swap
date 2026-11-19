@@ -1819,14 +1819,22 @@ class TestRun:
             "cswap", "run", ACCOUNT_EMAIL, "--share-history", "--",
         ]
 
+    @pytest.mark.parametrize(
+        "email", ["o'brien@example.com", ACCOUNT_EMAIL + "\n"]
+    )
     def test_declared_account_is_the_slot_when_the_email_has_odd_characters(
-        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
-        monkeypatch,
+        self, manager, monkeypatch, email
     ):
         monkeypatch.setattr(session_mod, "_launch_prog", lambda: "cswap")
-        # An email the word rule rejects (a quote), so the slot number goes.
-        words = manager._launch_words("2", "o'brien@example.com", True, None, False)
+        # An email the word rule rejects (a quote, or a trailing newline a
+        # shell would run as the end of the command), so the slot number goes.
+        words = manager._launch_words("2", email, True, None, False)
         assert words == ["cswap", "run", "2", "--"]
+
+    def test_a_word_with_a_trailing_newline_is_never_exported(self):
+        env = {"CSWAP_LAUNCH": "inherited"}
+        SessionManager._declare_launch(env, ["cswap", "run", "2\n", "--"])
+        assert "CSWAP_LAUNCH" not in env
 
     def test_declared_account_is_the_slot_when_the_email_leads_elsewhere(
         self, manager, monkeypatch

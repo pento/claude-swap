@@ -270,10 +270,13 @@ def mark_session_stale(session_dir: Path) -> bool:
     except OSError:
         return False
 
+
 # The launch declaration (see the module docstring). A word outside this set
 # could not be typed into a shell unquoted, so it is never exported.
 LAUNCH_ENV = "CSWAP_LAUNCH"
-_LAUNCH_WORD = re.compile(r"^[A-Za-z0-9@%+=:,./_-]{1,256}$")
+# ``fullmatch``, never ``match`` with ``$``: ``$`` also matches before a
+# trailing newline, which a shell would run as the end of the command.
+_LAUNCH_WORD = re.compile(r"[A-Za-z0-9@%+=:,./_-]{1,256}")
 
 
 def _launch_prog() -> str:
@@ -1069,7 +1072,7 @@ class SessionManager:
         flag was given), so the words never turn a default into a choice.
         """
         account = account_num
-        if _LAUNCH_WORD.match(email or ""):
+        if _LAUNCH_WORD.fullmatch(email or ""):
             try:
                 if self.switcher.resolve_account(email)[0] == account_num:
                     account = email
@@ -1095,7 +1098,7 @@ class SessionManager:
         safe to export and the variable is removed, so a nested launch never
         leaves its parent's words on a process they don't describe.
         """
-        if words and all(_LAUNCH_WORD.match(w) for w in words):
+        if words and all(_LAUNCH_WORD.fullmatch(w) for w in words):
             env[LAUNCH_ENV] = json.dumps(
                 {"v": 1, "argv": words, "pid": os.getpid()},
                 separators=(",", ":"),
