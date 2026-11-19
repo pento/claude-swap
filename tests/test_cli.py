@@ -1333,6 +1333,42 @@ class TestRunCommand:
         calls = self._dispatch(["run", "2", "--no-share-history"])
         assert ("run", "2", [], True, False, False) in calls
 
+    @pytest.mark.parametrize(
+        "typed, expected",
+        [
+            (["2"], ("run", "user@example.com", [], True, None, False)),
+            (
+                ["2", "--no-share", "--no-share-history", "--require-session"],
+                ("run", "user@example.com", [], False, False, True),
+            ),
+            (["2", "--share-history"], ("run", "user@example.com", [], True, True, False)),
+        ],
+    )
+    def test_declared_launch_round_trips(self, typed, expected):
+        """The words cswap exports, plus claude's own arguments, run again as
+        the same account with the same flags."""
+        from claude_swap.session import SessionManager
+
+        switcher = MagicMock()
+        switcher.resolve_account.return_value = ("2", "user@example.com", "")
+        manager = SessionManager.__new__(SessionManager)
+        manager.switcher = switcher
+        flags = typed[1:]
+        words = manager._launch_words(
+            "2",
+            "user@example.com",
+            share="--no-share" not in flags,
+            share_history=(
+                True if "--share-history" in flags
+                else False if "--no-share-history" in flags
+                else None
+            ),
+            require_session="--require-session" in flags,
+        )
+        assert words[-1] == "--"
+        calls = self._dispatch([*words[1:], "--resume", "X"])
+        assert expected[:2] + (["--resume", "X"],) + expected[3:] in calls
+
     @pytest.mark.parametrize("stored", ["true", "false"])
     def test_share_history_setting_is_not_resolved_here(self, stored):
         """One reader for run.shareHistory, and it is not the CLI: a second
