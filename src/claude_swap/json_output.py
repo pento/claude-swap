@@ -43,6 +43,10 @@ USAGE_RELOGIN_REQUIRED = "re-login needed"
 # (stash the foreign credential, restore the slot's backup), so autoswitch
 # should treat the active as unknown-headroom and fail over.
 USAGE_FOREIGN_CREDENTIAL = "foreign credential"
+# An Anthropic-profile slot (``anthropic_profile``): a Console login Claude Code
+# keeps and refreshes itself, used only by ``cswap run``. cswap holds no token
+# for it, so there is no usage to fetch.
+USAGE_ANTHROPIC_PROFILE = "anthropic profile"
 
 
 def _window_to_json(entry: dict) -> dict:
@@ -277,6 +281,7 @@ def usage_fields(
     session may renew), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
+    ``USAGE_ANTHROPIC_PROFILE`` sentinel (``cswap run``-only profile slot), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
     another account; usage suppressed, a switch repairs the drift), the
     ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed). ``fetched_at``
@@ -294,9 +299,28 @@ def usage_fields(
         return "relogin_required", None
     if entry == USAGE_FOREIGN_CREDENTIAL:
         return "foreign_credential", None
+    if entry == USAGE_ANTHROPIC_PROFILE:
+        return "anthropic_profile", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None
+
+
+def profile_fields(
+    name: str, signed_in: bool, expires_at: float | None
+) -> dict:
+    """The additive row fields of an Anthropic-profile slot: ``kind``,
+    ``profile``, ``profileSignedIn`` and, when the profile's credential
+    records one, ``profileTokenExpiresAt`` (the access token's expiry, which
+    Claude Code refreshes past on its own)."""
+    fields: dict = {
+        "kind": "profile",
+        "profile": name,
+        "profileSignedIn": signed_in,
+    }
+    if expires_at is not None:
+        fields["profileTokenExpiresAt"] = _timestamp(expires_at)
+    return fields
 
 
 def account_ref(number: int | None, email: str) -> dict:
@@ -401,9 +425,11 @@ def account_row(
     policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
     subscription_plan: dict | None = None,
+    profile: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
-    backoff only; a lapsed one is the caller's to withhold."""
+    backoff only; a lapsed one is the caller's to withhold. ``profile``
+    carries an Anthropic-profile slot's fields (``profile_fields``)."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
@@ -435,6 +461,9 @@ def account_row(
     # (see ``subscription``); a slot never fetched emits no key at all.
     if subscription_plan:
         row["plan"] = subscription_plan_fields(subscription_plan)
+    # Additive fields: only an Anthropic-profile slot carries them.
+    if profile:
+        row.update(profile)
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

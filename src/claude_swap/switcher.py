@@ -25,10 +25,11 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace, subscription
+from claude_swap import anthropic_profile, oauth, pace, subscription
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    USAGE_ANTHROPIC_PROFILE,
     USAGE_API_KEY,
     USAGE_FOREIGN_CREDENTIAL,
     USAGE_KEYCHAIN_UNAVAILABLE,
@@ -38,6 +39,7 @@ from claude_swap.json_output import (
     account_ref,
     account_row,
     last_good_usage_fields,
+    profile_fields,
     usage_failure_fields,
     usage_fields,
     usage_freshness_fields,
@@ -292,10 +294,14 @@ ERROR_NOTES = {
     ),
 }
 
+# Why a rotation passes over an Anthropic-profile slot.
+_PROFILE_SKIP_REASON = "(Anthropic profile, cswap run only)"
+
 SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
+    USAGE_ANTHROPIC_PROFILE: "Anthropic profile · cswap run only",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
 }
@@ -336,6 +342,30 @@ def _plan_marker(record: dict | None, now: float) -> str:
     if now - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
         marker += f" {dimmed('(' + format_age(int(record['fetchedAt'] * 1000)) + ')')}"
     return marker
+
+
+def _profile_lines(
+    account_num: str, name: str, state: anthropic_profile.ProfileState,
+    now: float | None = None,
+) -> list[str]:
+    """Styled lines (sans indent) for an Anthropic-profile slot in ``list``:
+    what it is, then whether the profile is signed in. Never a token."""
+    now = time.time() if now is None else now
+    if not state.signed_in:
+        detail = f"not signed in · run: cswap run {account_num}, then /login"
+    elif state.expires_at is None:
+        detail = "signed in"
+    elif state.expires_at > now:
+        detail = (
+            f"signed in · token expires {oauth.login_expiry_clock(state.expires_at, now)}"
+            f"  in {oauth.format_countdown(state.expires_at - now)}"
+        )
+    else:
+        detail = "signed in · token expired; Claude Code refreshes it on launch"
+    return [
+        dimmed(f"Anthropic profile {name} · cswap run only"),
+        f"{dimmed('└')} {muted(detail)}",
+    ]
 
 
 def _usage_entry_lines(
@@ -1046,11 +1076,12 @@ class ClaudeAccountSwitcher:
 
         Used by switch() and switch_to() to decide whether a target slot can
         be activated without re-adding the account. Tolerates stale sequence
-        entries that reference a removed account record.
+        entries that reference a removed account record. An Anthropic-profile
+        slot is never switchable: it is for ``cswap run`` only.
         """
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num))
-        if not record:
+        if not record or anthropic_profile.is_profile_record(record):
             return False
         email = record.get("email", "")
         # Eligibility only (the snapshot's `switchable` flag, rotation
@@ -1962,6 +1993,8 @@ class ClaudeAccountSwitcher:
         accounts = (self._get_sequence_data() or {}).get("accounts", {})
         updates: dict[str, dict] = {}
         for num, email, _org_name, org_uuid, is_active, creds, _alias in accounts_info:
+            if anthropic_profile.is_profile_record(accounts.get(str(num))):
+                continue  # no claude.ai subscription behind a Console profile
             key = subscription.identity_key(email, org_uuid)
             if not subscription.is_due(records.get(key), store.clock()):
                 continue
@@ -2402,7 +2435,8 @@ class ClaudeAccountSwitcher:
             print(dimmed("  It is back in the rotation."))
 
     def account_kind_for(self, account_num: str) -> str:
-        """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
+        """Public wrapper: ``"api_key"``, ``"profile"`` or ``"oauth"`` (setup-tokens
+        read as oauth)."""
         return self._account_kind(account_num)
 
     def account_email(self, account_num: str) -> str:
@@ -3249,7 +3283,7 @@ class ClaudeAccountSwitcher:
     ) -> list[str]:
         """Source-labelled token-status lines for one account's display row."""
         num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
-        if looks_like_api_key(creds):
+        if looks_like_api_key(creds) or self._profile_slot_name(str(num)) is not None:
             return []
         if is_active:
             line = _label_token_status("active profile", creds)
@@ -3755,7 +3789,9 @@ class ClaudeAccountSwitcher:
         return self._find_account_slot(data, email, organization_uuid) is not None
 
     def _account_kind(self, account_num: str | None) -> str:
-        """Stored kind for a managed slot: ``"api_key"`` or ``"oauth"`` (default).
+        """Stored kind for a managed slot: ``"api_key"``, ``"profile"`` (an
+        Anthropic-profile slot, see ``anthropic_profile``) or ``"oauth"``
+        (default).
 
         Slots added before this field existed have no ``kind`` and read as
         ``"oauth"`` (back-compat).
@@ -3764,7 +3800,25 @@ class ClaudeAccountSwitcher:
             return "oauth"
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num), {})
-        return "api_key" if record.get("kind") == "api_key" else "oauth"
+        kind = record.get("kind")
+        return kind if kind in ("api_key", anthropic_profile.PROFILE_KIND) else "oauth"
+
+    def _profile_slot_name(self, account_num: str) -> str | None:
+        """The slot's Anthropic-profile name, or ``None`` when it is not a
+        profile slot. A profile record whose name is unusable answers with
+        the stored text, so refusals can still name it."""
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num))
+        if not anthropic_profile.is_profile_record(record):
+            return None
+        return str(record.get("profile") or "")
+
+    def _refuse_profile_slot_switch(self, account_num: str) -> None:
+        """Profile slots are for ``cswap run`` only; every switch path refuses
+        one before it touches anything."""
+        name = self._profile_slot_name(account_num)
+        if name is not None:
+            raise SwitchError(anthropic_profile.run_only_message(account_num, name))
 
     def _reject_identity_drift_since_verify(
         self, verified: tuple[str, str, str]
@@ -3979,6 +4033,46 @@ class ClaudeAccountSwitcher:
                 "'cswap add-token sk-ant-...' instead of 'cswap add'."
             )
 
+    def _reject_capture_without_login(self, creds: str) -> None:
+        """Guard for ``add_account``: refuse a credential that holds no login.
+
+        The active store can hold only Claude Code's shared fields (such as
+        ``mcpOAuth``) with no ``claudeAiOauth`` tokens, which is what a
+        keyless Console sign-in leaves behind: Claude Code (2.1.332) keeps
+        that login as an Anthropic profile instead (see ``anthropic_profile``). Capturing it would register a slot
+        with nothing to switch to. A JSON object with no ``claudeAiOauth``
+        object and no access or refresh token at the top (the legacy shape)
+        is refused before anything is written. A ``claudeAiOauth`` with both
+        tokens emptied is ``_reject_foreign_credential_capture``'s to refuse.
+        When the profile Claude Code would use is signed in, the message
+        names the command that adds it.
+        """
+        if looks_like_api_key(creds):
+            return
+        try:
+            data = json.loads(creds)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        if isinstance(data.get("claudeAiOauth"), dict):
+            return
+        if data.get("accessToken") or data.get("refreshToken"):
+            return
+        message = (
+            "The active login holds no Claude Code OAuth tokens, so there is "
+            "nothing to add. Nothing was changed."
+        )
+        name = anthropic_profile.active_profile_name()
+        if anthropic_profile.read_profile_state(name).signed_in:
+            message += (
+                f" Claude Code is signed in to Anthropic profile '{name}' "
+                f"(a Console login). Add it with: cswap add --profile {name}"
+            )
+        else:
+            message += " Log in with Claude Code (/login), then run cswap add again."
+        raise ConfigError(message)
+
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
         """Reject registering a token whose (email, personal-org) already exists as
         the *other* kind.
@@ -3999,7 +4093,9 @@ class ClaudeAccountSwitcher:
         existing_kind = self._account_kind(slot)
         new_kind = "api_key" if is_api_key else "oauth"
         if existing_kind != new_kind:
-            existing_label = "API-key" if existing_kind == "api_key" else "OAuth"
+            existing_label = {
+                "api_key": "API-key", anthropic_profile.PROFILE_KIND: "Anthropic-profile",
+            }.get(existing_kind, "OAuth")
             new_label = "API-key" if is_api_key else "OAuth"
             raise ValidationError(
                 f"'{email}' already exists as an {existing_label} account "
@@ -4202,6 +4298,12 @@ class ClaudeAccountSwitcher:
             seq = self._get_sequence_data()
             account_num = self._find_account_slot(seq, current_email, current_org_uuid)
             matched_org_name = seq["accounts"][account_num].get("organizationName", "") if account_num else ""
+            if account_num and self._profile_slot_name(account_num) is not None:
+                raise ValidationError(
+                    f"Account-{account_num} is an Anthropic-profile slot with "
+                    f"this login's email and organization; it stores no "
+                    f"credential. Add this login to another slot with --slot."
+                )
 
             if alias is not None:
                 conflict = self._alias_in_use(alias, exclude_num=account_num)
@@ -4216,6 +4318,7 @@ class ClaudeAccountSwitcher:
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
+            self._reject_capture_without_login(current_creds)
             current_creds = self._reject_foreign_credential_capture(
                 current_creds, current_email, current_org_uuid,
                 current_account_uuid,
@@ -4349,6 +4452,7 @@ class ClaudeAccountSwitcher:
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
+        self._reject_capture_without_login(current_creds)
         current_creds = self._reject_foreign_credential_capture(
             current_creds, current_email, current_org_uuid, current_account_uuid
         )
@@ -4663,6 +4767,178 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
+    def add_profile_account(
+        self,
+        name: str,
+        slot: int | None = None,
+        alias: str | None = None,
+        email: str | None = None,
+        assume_yes: bool = False,
+    ) -> None:
+        """Register an Anthropic profile (a keyless Console login) as a slot.
+
+        The slot is for ``cswap run`` only (see ``anthropic_profile``). Nothing
+        secret is stored: the record names the profile, and its organization
+        is read from the profile's credential file when Claude Code has
+        written one. The profile need not be signed in yet; the first
+        ``cswap run`` says how to sign in.
+
+        Args:
+            name: The profile name, as Claude Code's ``ANTHROPIC_PROFILE``
+                  takes it.
+            slot: Slot number; auto-assigned when ``None``. Re-adding the
+                  same profile to its own slot refreshes the record and
+                  keeps the user's settings on it.
+            alias: Optional display alias.
+            email: Slot label; defaults to the label a re-added slot already
+                  has, else ``<name>@anthropic-profile.local``.
+            assume_yes: Skip the occupied-slot overwrite prompt.
+        """
+        self._refuse_session_shell()
+        try:
+            name = anthropic_profile.validate_profile_name(name)
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
+        if email and not self._validate_email(email):
+            raise ValidationError(f"Invalid email format: {email}")
+        if alias is not None:
+            try:
+                alias = normalize_alias(alias)
+            except ValueError as e:
+                raise ValidationError(str(e)) from e
+        if slot is not None and slot < 1:
+            raise ConfigError("Slot number must be >= 1")
+
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
+
+        state = anthropic_profile.read_profile_state(name)
+        org_uuid = state.organization_uuid
+        org_name = state.organization_name
+
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        registered = next(
+            (
+                num for num, record in accounts.items()
+                if anthropic_profile.profile_name_of(record) == name
+            ),
+            None,
+        )
+        if registered is not None and (slot is None or str(slot) != registered):
+            raise ValidationError(
+                f"Anthropic profile '{name}' is already Account-{registered}. "
+                f"Remove it first, or re-add it with --slot {registered}."
+            )
+        account_num = str(slot) if slot is not None else str(
+            self._get_next_account_number()
+        )
+        prior = accounts.get(account_num)
+        same_profile = anthropic_profile.profile_name_of(prior) == name
+        # Re-adding keeps the slot's label unless --email names a new one:
+        # the session profile and the directory mappings are keyed by it.
+        if email:
+            label = email
+        elif same_profile and prior.get("email"):
+            label = prior["email"]
+        else:
+            label = anthropic_profile.default_label(name)
+
+        holder = self._find_account_slot(data, label, org_uuid)
+        if holder is not None and holder != account_num:
+            raise ValidationError(
+                f"'{label}' is already Account-{holder}; two slots cannot "
+                f"share an email and organization. Pass a distinct --email."
+            )
+        if alias is not None:
+            conflict = self._alias_in_use(alias, exclude_num=account_num)
+            if conflict is not None:
+                raise ValidationError(
+                    f"Alias '{alias}' is already used by account {conflict}"
+                )
+
+        carried: dict = {}
+        if prior and same_profile:
+            carried = self._carried_settings(prior)
+            if prior.get("email") != label:
+                # The session profile is keyed by the label; the login itself
+                # stays in the Anthropic config dir.
+                self._delete_account_files(account_num, prior.get("email", ""))
+        elif prior:
+            existing_email = prior.get("email", "unknown")
+            existing_tag = self._get_display_tag(
+                existing_email,
+                prior.get("organizationName", ""),
+                prior.get("organizationUuid", ""),
+            )
+            warning(f"Slot {account_num} already occupied")
+            print(f"{existing_email} {muted(f'[{existing_tag}]')}")
+            if not assume_yes:
+                try:
+                    answer = input(
+                        f"Overwrite slot {account_num}? [y/N] "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print(f"\n{dimmed('Cancelled')}")
+                    return
+                if answer not in ("y", "yes"):
+                    print(dimmed("Cancelled"))
+                    return
+            self._delete_account_files(account_num, existing_email)
+            data = self._get_sequence_data()
+            if int(account_num) in data["sequence"]:
+                data["sequence"].remove(int(account_num))
+            del data["accounts"][account_num]
+            self._write_json(self.sequence_file, data)
+            self._prune_mappings(
+                existing_email, prior.get("organizationUuid", "") or ""
+            )
+
+        data = self._get_sequence_data()
+        record = {
+            "email": label,
+            "uuid": "",
+            "organizationUuid": org_uuid,
+            "organizationName": org_name,
+            "added": get_timestamp(),
+            "kind": anthropic_profile.PROFILE_KIND,
+            "profile": name,
+        }
+        record.update(carried)
+        if alias is not None:
+            record["alias"] = alias
+        data["accounts"][account_num] = record
+        if int(account_num) not in data["sequence"]:
+            data["sequence"].append(int(account_num))
+            data["sequence"].sort()
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        if prior and same_profile:
+            # A new label, or the organization the profile's first sign-in
+            # recorded, changes the slot's identity; keep its mappings on it.
+            from claude_swap.mappings import MappingStore
+
+            MappingStore(self.backup_dir).retarget_account(
+                prior.get("email", ""), prior.get("organizationUuid", "") or "",
+                label, org_uuid,
+            )
+
+        self._logger.info(
+            f"Added account {account_num}: Anthropic profile {name} ({label})"
+        )
+        verb = "Updated" if prior and same_profile else "Added"
+        print(
+            f"{accent(verb)} Account {account_num}: {label} "
+            f"{muted(f'(Anthropic profile {name}, cswap run only)')}"
+        )
+        if not state.signed_in:
+            print(dimmed(
+                f"Not signed in yet: run `cswap run {account_num}`, then "
+                "/login with your Anthropic Console account."
+            ))
+
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
 
@@ -4781,7 +5057,12 @@ class ClaudeAccountSwitcher:
             alias = account.get("alias", "") or ""
             is_active = str(num) == active_num
 
-            if is_active:
+            if anthropic_profile.is_profile_record(account):
+                # Never the live login and never holds a stored credential:
+                # Claude Code keeps the profile's token outside cswap.
+                is_active = False
+                creds = ""
+            elif is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
@@ -5544,6 +5825,9 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
+        if self._profile_slot_name(str(num)) is not None:
+            # Anthropic-profile slot: cswap holds no token, so nothing to fetch.
+            return USAGE_ANTHROPIC_PROFILE
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -6305,6 +6589,14 @@ class ClaudeAccountSwitcher:
                     break
         return out
 
+    def _profile_row_fields(self, account_num: str) -> dict | None:
+        """``--json`` fields of an Anthropic-profile slot, ``None`` for others."""
+        name = self._profile_slot_name(account_num)
+        if name is None:
+            return None
+        state = anthropic_profile.read_profile_state(name)
+        return profile_fields(name, state.signed_in, state.expires_at)
+
     def _build_list_payload(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -6340,6 +6632,7 @@ class ClaudeAccountSwitcher:
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                     subscription_plan=(plans or {}).get(str(num)),
+                    profile=self._profile_row_fields(str(num)),
                 )
             )
         payload = {
@@ -6409,8 +6702,17 @@ class ClaudeAccountSwitcher:
                 markers += f" {muted('(disabled)')}"
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label}{tag}{markers}")
-            login_expires_at = oauth.login_expires_at_epoch(creds)
-            for line in _usage_entry_lines(entries[str(num)], login_expires_at):
+            profile_name = self._profile_slot_name(str(num))
+            if profile_name is not None:
+                usage_lines = _profile_lines(
+                    str(num), profile_name,
+                    anthropic_profile.read_profile_state(profile_name),
+                )
+            else:
+                usage_lines = _usage_entry_lines(
+                    entries[str(num)], oauth.login_expires_at_epoch(creds)
+                )
+            for line in usage_lines:
                 print(f"     {line}")
 
             if show_token_status:
@@ -6733,6 +7035,8 @@ class ClaudeAccountSwitcher:
             if target_disabled or not self._account_is_switchable(target):
                 if target_disabled:
                     reason = console_reason = "(disabled)"
+                elif self._profile_slot_name(target) is not None:
+                    reason = console_reason = _PROFILE_SKIP_REASON
                 else:
                     reason = "(no stored credentials/config)"
                     console_reason = (
@@ -6947,6 +7251,17 @@ class ClaudeAccountSwitcher:
                 else:
                     print(f"{accent('Skipping')} Account-{candidate} (disabled)")
                 continue
+            if self._profile_slot_name(candidate) is not None:
+                if json_output:
+                    warnings.append(
+                        f"Skipped Account-{candidate} {_PROFILE_SKIP_REASON}"
+                    )
+                else:
+                    print(
+                        f"{accent('Skipping')} Account-{candidate} "
+                        f"{_PROFILE_SKIP_REASON}"
+                    )
+                continue
             if not self._account_is_switchable(candidate):
                 if json_output:
                     warnings.append(
@@ -7112,6 +7427,7 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data()
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
+        self._refuse_profile_slot_switch(target_account)
 
         # Short-circuit a no-op before mutating (issue #79). A self-switch
         # would first back up the live credentials into the target slot —
@@ -7688,6 +8004,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import scan_live_sessions
 
         self._refuse_session_shell()
+        self._refuse_profile_slot_switch(target_account)
         warnings_out: list[str] = []
         # Session-mode drift. Switching the default login to an account that
         # also has a live session profile puts the same refresh token in two

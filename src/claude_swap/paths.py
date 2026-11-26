@@ -111,6 +111,22 @@ def get_credentials_path() -> Path:
     return secure_home / ".credentials.json"
 
 
+def get_anthropic_config_dir() -> Path:
+    """Return the Anthropic config dir, where Claude Code keeps Console profiles.
+
+    Claude Code (2.1.332): ``ANTHROPIC_CONFIG_DIR`` if set, else
+    ``$XDG_CONFIG_HOME/anthropic``, else ``~/.config/anthropic``. See
+    ``anthropic_profile`` for what lives there.
+    """
+    env = os.environ.get("ANTHROPIC_CONFIG_DIR")
+    if env:
+        return Path(env)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / "anthropic"
+    return Path.home() / ".config" / "anthropic"
+
+
 def get_legacy_backup_root() -> Path:
     """Return the legacy (pre-XDG) backup root: ``~/.claude-swap-backup``."""
     return Path.home() / LEGACY_BACKUP_DIRNAME

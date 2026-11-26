@@ -16,7 +16,11 @@ from rich.text import Text
 from textual.widgets import ListItem, Static
 
 from claude_swap import oauth, pace, subscription
-from claude_swap.json_output import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
+from claude_swap.json_output import (
+    USAGE_ANTHROPIC_PROFILE,
+    USAGE_API_KEY,
+    USAGE_RELOGIN_REQUIRED,
+)
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.printer import format_age
@@ -27,6 +31,9 @@ from claude_swap.tui.theme import Palette
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
+
+# Sentinels that describe what an account is, not something wrong with it.
+_QUIET_SENTINELS = (USAGE_API_KEY, USAGE_ANTHROPIC_PROFILE)
 
 _BAR_FILLED = "━"
 _BAR_HALF = "╸"
@@ -288,13 +295,13 @@ def account_card_text(
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         text.append("\n    ")
-        style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
-        marker = "·" if sentinel == USAGE_API_KEY else "⚠"
+        style = palette.muted if sentinel in _QUIET_SENTINELS else palette.sev_warn
+        marker = "·" if sentinel in _QUIET_SENTINELS else "⚠"
         text.append(f"{marker} {data.sentinel_label(sentinel)}", style=style)
         # Same supplementary line `cswap list` prints: the last good
         # measurement behind the sentinel (API-key accounts have no quota to
         # have "seen").
-        if sentinel != USAGE_API_KEY:
+        if sentinel not in _QUIET_SENTINELS:
             last_seen = data.last_seen_note(acc.usage)
             if last_seen is not None:
                 text.append("\n    ")
@@ -395,7 +402,7 @@ def mini_account_text(
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
-        style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
+        style = palette.muted if sentinel in _QUIET_SENTINELS else palette.sev_warn
         text.append(data.sentinel_label(sentinel), style=style)
         return _end_mini(text, acc, login, now, palette)
 

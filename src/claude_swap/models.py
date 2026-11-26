@@ -245,7 +245,7 @@ class AccountSnapshot:
     org_name: str
     org_uuid: str
     is_active: bool
-    kind: str  # "oauth" | "api_key"
+    kind: str  # "oauth" | "api_key" | "profile" (Anthropic profile, run only)
     switchable: bool
     usage: UsageEntry
     alias: str = ""

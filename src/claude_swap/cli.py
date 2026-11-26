@@ -1508,6 +1508,7 @@ Commands:
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
+  %(prog)s add --profile NAME         add an Anthropic Console profile (run only)
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
@@ -1612,10 +1613,18 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--email",
         metavar="EMAIL",
         help=(
-            "Email address for the account. Optional with 'add-token'; "
-            "defaults to setup-token-{slot}@token.local (or "
-            "api-key-{slot}@token.local for API keys) since these tokens "
-            "carry no real email metadata."
+            "Email address for the account. Optional with 'add-token' and "
+            "'add --profile'; defaults to setup-token-{slot}@token.local (or "
+            "api-key-{slot}@token.local for API keys, NAME@anthropic-profile.local "
+            "for a profile) since these carry no real email metadata."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        metavar="NAME",
+        help=(
+            "With 'add': register Claude Code's Anthropic profile NAME (a "
+            "keyless Console login) as a slot for 'cswap run' only"
         ),
     )
     parser.add_argument(
@@ -1872,8 +1881,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
-    if args.email is not None and args.add_token is None:
-        parser.error("--email can only be used with 'add-token'")
+    if args.profile is not None and not args.add_account:
+        parser.error("--profile can only be used with 'add'")
+
+    if args.email is not None and args.add_token is None and args.profile is None:
+        parser.error("--email can only be used with 'add-token' or 'add --profile'")
 
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
@@ -1944,7 +1956,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
-        if args.add_account:
+        if args.add_account and args.profile is not None:
+            switcher.add_profile_account(
+                args.profile, slot=args.slot, alias=args.alias, email=args.email
+            )
+        elif args.add_account:
             switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
             switcher.add_account_from_token(
