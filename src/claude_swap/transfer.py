@@ -3,6 +3,11 @@
 Moves the OAuth credentials and config across machines via a portable
 JSON envelope. No encryption is built in — users compose their own
 (e.g. `cswap --export - | gpg -c > out.gpg`).
+
+An Anthropic-profile slot (``anthropic_profile``) travels as its record only,
+``kind: "profile"`` and ``profile: <name>`` with no ``credentials`` or
+``config``: cswap holds nothing secret for it, and the login itself stays in
+Claude Code's Anthropic config dir on each machine.
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_swap import __version__
+from claude_swap import __version__, anthropic_profile
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
@@ -202,6 +207,22 @@ def export_accounts(
         record = accounts_map[num]
         email = record.get("email", "")
         org_uuid = record.get("organizationUuid", "") or ""
+
+        if anthropic_profile.is_profile_record(record):
+            profile_entry: dict[str, Any] = {
+                "number": int(num),
+                "email": email,
+                "uuid": record.get("uuid", "") or "",
+                "organizationUuid": org_uuid,
+                "organizationName": record.get("organizationName", "") or "",
+                "added": record.get("added", ""),
+                "kind": anthropic_profile.PROFILE_KIND,
+                "profile": record.get("profile", ""),
+            }
+            if record.get("alias"):
+                profile_entry["alias"] = record["alias"]
+            accounts_payload.append(profile_entry)
+            continue
 
         is_active = (
             current_identity is not None
@@ -400,12 +421,24 @@ def import_accounts(
         org_uuid = raw.get("organizationUuid", "") or ""
         creds_obj = raw.get("credentials")
         config_obj = raw.get("config")
-        if not isinstance(config_obj, dict):
+        profile_name: str | None = None
+        if raw.get("kind") == anthropic_profile.PROFILE_KIND:
+            try:
+                profile_name = anthropic_profile.validate_profile_name(
+                    raw.get("profile", "")
+                )
+            except ValueError as e:
+                raise TransferError(f"profile for {email}: {e}") from e
+        elif not isinstance(config_obj, dict):
             raise TransferError(f"config for {email} must be a JSON object")
         # API-key accounts carry the credential as a raw string; OAuth accounts
         # carry a JSON object.
-        is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
-        if is_api_key:
+        is_api_key = profile_name is None and (
+            raw.get("kind") == "api_key" or isinstance(creds_obj, str)
+        )
+        if profile_name is not None:
+            creds_text = ""
+        elif is_api_key:
             if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
                 raise TransferError(
                     f"API-key credentials for {email} must be a raw sk-ant-… key "
@@ -449,10 +482,17 @@ def import_accounts(
                 "org_name": raw.get("organizationName", "") or "",
                 "uuid": raw.get("uuid", "") or "",
                 "added": raw.get("added") or get_timestamp(),
-                "kind": "api_key" if is_api_key else "oauth",
+                "kind": (
+                    anthropic_profile.PROFILE_KIND if profile_name is not None
+                    else "api_key" if is_api_key else "oauth"
+                ),
+                "profile": profile_name,
                 "alias": alias,
                 "creds_text": creds_text,
-                "config_text": json.dumps(config_obj, indent=2),
+                "config_text": (
+                    json.dumps(config_obj, indent=2)
+                    if profile_name is None else ""
+                ),
             }
         )
 
@@ -493,6 +533,18 @@ def import_accounts(
         existing_slot = switcher._find_account_slot(
             data, entry["email"], entry["org_uuid"]
         )
+        is_profile = entry["kind"] == anthropic_profile.PROFILE_KIND
+        if existing_slot is not None and is_profile != anthropic_profile.is_profile_record(
+            data.get("accounts", {}).get(existing_slot)
+        ):
+            # A profile record over a stored login (or the reverse) would
+            # orphan the login or leave a profile slot holding one.
+            _eprint(
+                f"Skipped {entry['email']} (slot {existing_slot} holds a "
+                "different kind of account)"
+            )
+            skipped += 1
+            continue
 
         if existing_slot is not None:
             if force:
@@ -554,12 +606,13 @@ def import_accounts(
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
-        switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
-        )
-        switcher._write_account_config(
-            target_num, entry["email"], entry["config_text"]
-        )
+        if not is_profile:
+            switcher._write_account_credentials(
+                target_num, entry["email"], entry["creds_text"]
+            )
+            switcher._write_account_config(
+                target_num, entry["email"], entry["config_text"]
+            )
         # Every successful import write introduces credential material whose
         # previous auth verdict is no longer authoritative, so lift any
         # dead-token quarantine on this slot (mirrors add_account / the
@@ -582,6 +635,9 @@ def import_accounts(
         }
         if entry["kind"] == "api_key":
             new_record["kind"] = "api_key"
+        elif is_profile:
+            new_record["kind"] = anthropic_profile.PROFILE_KIND
+            new_record["profile"] = entry["profile"]
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
         data["accounts"][target_num] = new_record
