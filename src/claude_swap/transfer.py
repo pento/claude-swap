@@ -7,7 +7,10 @@ JSON envelope. No encryption is built in — users compose their own
 An Anthropic-profile slot (``anthropic_profile``) travels as its record only,
 ``kind: "profile"`` and ``profile: <name>`` with no ``credentials`` or
 ``config``: cswap holds nothing secret for it, and the login itself stays in
-Claude Code's Anthropic config dir on each machine.
+Claude Code's Anthropic config dir on each machine. Profile records go in the
+envelope's top-level ``profiles`` list, not ``accounts``, so a cswap without
+profile support (which reads only ``version``, ``encrypted``, ``accounts`` and
+``activeAccountNumber``) still imports every login and ignores the profiles.
 """
 
 from __future__ import annotations
@@ -203,6 +206,7 @@ def export_accounts(
     current_identity = switcher._get_current_account()
 
     accounts_payload: list[dict[str, Any]] = []
+    profiles_payload: list[dict[str, Any]] = []
     for num in target_nums:
         record = accounts_map[num]
         email = record.get("email", "")
@@ -221,7 +225,7 @@ def export_accounts(
             }
             if record.get("alias"):
                 profile_entry["alias"] = record["alias"]
-            accounts_payload.append(profile_entry)
+            profiles_payload.append(profile_entry)
             continue
 
         is_active = (
@@ -289,7 +293,7 @@ def export_accounts(
             entry["alias"] = record["alias"]
         accounts_payload.append(entry)
 
-    if not accounts_payload:
+    if not accounts_payload and not profiles_payload:
         raise TransferError(
             "no exportable accounts — all managed slots are missing stored "
             "credentials/config. Re-add with: cswap --add-account --slot <number>"
@@ -313,6 +317,8 @@ def export_accounts(
         "activeAccountNumber": active_in_payload,
         "accounts": accounts_payload,
     }
+    if profiles_payload:
+        envelope["profiles"] = profiles_payload
 
     serialized = json.dumps(envelope, indent=2)
 
@@ -324,7 +330,10 @@ def export_accounts(
 
     out_path = Path(destination).expanduser()
     _atomic_write_file(out_path, serialized + "\n")
-    _eprint(f"Exported {len(accounts_payload)} account(s) to {out_path}")
+    _eprint(
+        f"Exported {len(accounts_payload) + len(profiles_payload)} account(s) "
+        f"to {out_path}"
+    )
 
 
 def import_accounts(
@@ -400,7 +409,10 @@ def import_accounts(
         )
 
     accounts = envelope.get("accounts")
-    if not isinstance(accounts, list) or not accounts:
+    profiles = envelope.get("profiles", [])
+    if not isinstance(profiles, list):
+        raise TransferError("profiles in export file must be a list")
+    if not isinstance(accounts, list) or (not accounts and not profiles):
         raise TransferError("export file has no accounts to import")
 
     # Pass 1: validate every account before any writes. A malformed account
@@ -416,13 +428,22 @@ def import_accounts(
     normalized: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, str]] = set()
     seen_aliases: set[str] = set()
-    for raw in accounts:
+    for raw, in_profiles in [(r, False) for r in accounts] + [
+        (r, True) for r in profiles
+    ]:
         email, exported_num = _validate_imported_account(switcher, raw)
         org_uuid = raw.get("organizationUuid", "") or ""
         creds_obj = raw.get("credentials")
         config_obj = raw.get("config")
         profile_name: str | None = None
-        if raw.get("kind") == anthropic_profile.PROFILE_KIND:
+        if in_profiles and raw.get("kind", anthropic_profile.PROFILE_KIND) != (
+            anthropic_profile.PROFILE_KIND
+        ):
+            raise TransferError(
+                f"profiles entry for {email} must be an Anthropic profile "
+                f"(kind {anthropic_profile.PROFILE_KIND!r})"
+            )
+        if in_profiles or raw.get("kind") == anthropic_profile.PROFILE_KIND:
             try:
                 profile_name = anthropic_profile.validate_profile_name(
                     raw.get("profile", "")

@@ -559,7 +559,8 @@ class TestTransferAndRemove:
         out = temp_home / "export.json"
         export_accounts(switcher, str(out))
         envelope = json.loads(out.read_text())
-        (entry,) = envelope["accounts"]
+        assert envelope["accounts"] == []
+        (entry,) = envelope["profiles"]
         assert entry["kind"] == "profile" and entry["profile"] == "mythos"
         assert "credentials" not in entry and "config" not in entry
         assert ACCESS not in out.read_text()
@@ -579,7 +580,7 @@ class TestTransferAndRemove:
     def test_import_rejects_invalid_profile_name(self, switcher, temp_home: Path):
         src = temp_home / "bad.json"
         src.write_text(json.dumps({
-            "version": 1, "accounts": [{
+            "version": 1, "accounts": [], "profiles": [{
                 "number": 6, "email": "x@anthropic-profile.local",
                 "kind": "profile", "profile": "../evil",
             }],
@@ -587,6 +588,79 @@ class TestTransferAndRemove:
         from claude_swap.exceptions import TransferError
 
         with pytest.raises(TransferError, match="profile"):
+            import_accounts(switcher, str(src))
+
+    def test_export_keeps_profiles_out_of_the_accounts_list(
+        self, switcher, temp_home: Path
+    ):
+        """A cswap without profile support reads only ``version``,
+        ``encrypted``, ``accounts`` and ``activeAccountNumber``, and needs every
+        ``accounts`` entry to carry a ``config`` object and a ``credentials``
+        object or API-key string. A mixed export must still meet that."""
+        _seed_oauth_slot(switcher, "1", "me@example.com")
+        _write_profile()
+        switcher.add_profile_account("mythos", slot=6)
+        out = temp_home / "export.json"
+        export_accounts(switcher, str(out))
+        envelope = json.loads(out.read_text())
+
+        assert envelope["version"] == 1
+        assert [a["number"] for a in envelope["accounts"]] == [1]
+        for entry in envelope["accounts"]:
+            assert entry.get("kind") != "profile"
+            assert isinstance(entry["config"], dict)
+            assert isinstance(entry["credentials"], (dict, str))
+        assert [p["profile"] for p in envelope["profiles"]] == ["mythos"]
+
+    def test_export_without_profiles_has_no_profiles_key(
+        self, switcher, temp_home: Path
+    ):
+        _seed_oauth_slot(switcher, "1", "me@example.com")
+        out = temp_home / "export.json"
+        export_accounts(switcher, str(out))
+        assert "profiles" not in json.loads(out.read_text())
+
+    def test_mixed_round_trip(self, switcher, temp_home: Path):
+        _seed_oauth_slot(switcher, "1", "me@example.com")
+        switcher.add_profile_account("mythos", slot=6)
+        out = temp_home / "export.json"
+        export_accounts(switcher, str(out))
+        data = switcher._get_sequence_data()
+        data["accounts"] = {}
+        data["sequence"] = []
+        switcher._write_json(switcher.sequence_file, data)
+
+        import_accounts(switcher, str(out))
+        accounts = switcher._get_sequence_data()["accounts"]
+        assert accounts["1"]["email"] == "me@example.com"
+        assert "kind" not in accounts["1"]
+        assert accounts["6"]["kind"] == "profile"
+        assert accounts["6"]["profile"] == "mythos"
+
+    def test_import_rejects_a_login_in_the_profiles_list(
+        self, switcher, temp_home: Path
+    ):
+        from claude_swap.exceptions import TransferError
+
+        src = temp_home / "bad.json"
+        src.write_text(json.dumps({
+            "version": 1, "accounts": [], "profiles": [{
+                "number": 6, "email": "x@example.com", "kind": "api_key",
+                "credentials": "sk-ant-api03-x", "config": {},
+            }],
+        }))
+        with pytest.raises(TransferError, match="must be an Anthropic profile"):
+            import_accounts(switcher, str(src))
+        assert "6" not in switcher._get_sequence_data()["accounts"]
+
+    def test_import_rejects_profiles_that_is_not_a_list(
+        self, switcher, temp_home: Path
+    ):
+        from claude_swap.exceptions import TransferError
+
+        src = temp_home / "bad.json"
+        src.write_text(json.dumps({"version": 1, "accounts": [], "profiles": {}}))
+        with pytest.raises(TransferError, match="profiles"):
             import_accounts(switcher, str(src))
 
     def test_remove_leaves_anthropic_config_alone(self, switcher, capture_exec):
@@ -677,17 +751,18 @@ class TestReviewFixes:
         assert entry["email"] == "me@mythos.example"
         assert entry["organizationUuid"] == "org-console"
 
+    @pytest.mark.parametrize("key", ["profiles", "accounts"])
     def test_import_skips_a_profile_already_in_another_slot(
-        self, switcher, temp_home: Path, capsys
+        self, switcher, temp_home: Path, capsys, key
     ):
         switcher.add_profile_account("mythos", slot=6)
         src = temp_home / "dup.json"
-        src.write_text(json.dumps({
-            "version": 1, "accounts": [{
-                "number": 7, "email": "other@anthropic-profile.local",
-                "kind": "profile", "profile": "mythos",
-            }],
-        }))
+        envelope = {"version": 1, "accounts": []}
+        envelope[key] = [{
+            "number": 7, "email": "other@anthropic-profile.local",
+            "kind": "profile", "profile": "mythos",
+        }]
+        src.write_text(json.dumps(envelope))
         import_accounts(switcher, str(src))
         assert "7" not in switcher._get_sequence_data()["accounts"]
         assert "already slot 6" in capsys.readouterr().err
