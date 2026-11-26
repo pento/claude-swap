@@ -21,9 +21,6 @@ from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_RELOGIN_REQUIRED,
 )
-
-# Sentinels that describe what an account is, not something wrong with it.
-_QUIET_SENTINELS = (USAGE_API_KEY, USAGE_ANTHROPIC_PROFILE)
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.printer import format_age
@@ -34,6 +31,9 @@ from claude_swap.tui.theme import Palette
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
+
+# Sentinels that describe what an account is, not something wrong with it.
+_QUIET_SENTINELS = (USAGE_API_KEY, USAGE_ANTHROPIC_PROFILE)
 
 _BAR_FILLED = "━"
 _BAR_HALF = "╸"

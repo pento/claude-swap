@@ -545,6 +545,23 @@ def import_accounts(
             )
             skipped += 1
             continue
+        if is_profile:
+            # One slot per profile, as ``add_profile_account`` keeps it.
+            holder = next(
+                (
+                    num for num, record in data.get("accounts", {}).items()
+                    if num != existing_slot
+                    and anthropic_profile.profile_name_of(record) == entry["profile"]
+                ),
+                None,
+            )
+            if holder is not None:
+                _eprint(
+                    f"Skipped {entry['email']} (Anthropic profile "
+                    f"'{entry['profile']}' is already slot {holder})"
+                )
+                skipped += 1
+                continue
 
         if existing_slot is not None:
             if force:

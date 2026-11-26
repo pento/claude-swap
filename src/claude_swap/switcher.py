@@ -4038,8 +4038,8 @@ class ClaudeAccountSwitcher:
 
         The active store can hold only Claude Code's shared fields (such as
         ``mcpOAuth``) with no ``claudeAiOauth`` tokens, which is what a
-        keyless Console sign-in leaves behind: Claude Code keeps that login
-        as an Anthropic profile instead. Capturing it would register a slot
+        keyless Console sign-in leaves behind: Claude Code (2.1.332) keeps
+        that login as an Anthropic profile instead (see ``anthropic_profile``). Capturing it would register a slot
         with nothing to switch to. A JSON object with no ``claudeAiOauth``
         object and no access or refresh token at the top (the legacy shape)
         is refused before anything is written. A ``claudeAiOauth`` with both
@@ -4790,7 +4790,8 @@ class ClaudeAccountSwitcher:
                   same profile to its own slot refreshes the record and
                   keeps the user's settings on it.
             alias: Optional display alias.
-            email: Slot label; defaults to ``<name>@anthropic-profile.local``.
+            email: Slot label; defaults to the label a re-added slot already
+                  has, else ``<name>@anthropic-profile.local``.
             assume_yes: Skip the occupied-slot overwrite prompt.
         """
         self._refuse_session_shell()
@@ -4812,7 +4813,6 @@ class ClaudeAccountSwitcher:
         self._init_sequence_file()
         self._migrate_org_fields()
 
-        label = email or anthropic_profile.default_label(name)
         state = anthropic_profile.read_profile_state(name)
         org_uuid = state.organization_uuid
         org_name = state.organization_name
@@ -4834,6 +4834,16 @@ class ClaudeAccountSwitcher:
         account_num = str(slot) if slot is not None else str(
             self._get_next_account_number()
         )
+        prior = accounts.get(account_num)
+        same_profile = anthropic_profile.profile_name_of(prior) == name
+        # Re-adding keeps the slot's label unless --email names a new one:
+        # the session profile and the directory mappings are keyed by it.
+        if email:
+            label = email
+        elif same_profile and prior.get("email"):
+            label = prior["email"]
+        else:
+            label = anthropic_profile.default_label(name)
 
         holder = self._find_account_slot(data, label, org_uuid)
         if holder is not None and holder != account_num:
@@ -4848,8 +4858,6 @@ class ClaudeAccountSwitcher:
                     f"Alias '{alias}' is already used by account {conflict}"
                 )
 
-        prior = accounts.get(account_num)
-        same_profile = anthropic_profile.profile_name_of(prior) == name
         carried: dict = {}
         if prior and same_profile:
             carried = self._carried_settings(prior)
@@ -4906,6 +4914,16 @@ class ClaudeAccountSwitcher:
             data["sequence"].sort()
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
+
+        if prior and same_profile:
+            # A new label, or the organization the profile's first sign-in
+            # recorded, changes the slot's identity; keep its mappings on it.
+            from claude_swap.mappings import MappingStore
+
+            MappingStore(self.backup_dir).retarget_account(
+                prior.get("email", ""), prior.get("organizationUuid", "") or "",
+                label, org_uuid,
+            )
 
         self._logger.info(
             f"Added account {account_num}: Anthropic profile {name} ({label})"

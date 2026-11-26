@@ -97,6 +97,28 @@ class MappingStore:
             self._write(mappings)
         return len(doomed)
 
+    def retarget_account(
+        self, old_email: str, old_org_uuid: str, email: str, org_uuid: str
+    ) -> int:
+        """Point every mapping of (old_email, old_org_uuid) at (email, org_uuid).
+
+        For a slot whose identity changes in place, such as an Anthropic-profile
+        slot re-added with a new label or organization. Return count moved.
+        """
+        old = (old_email, old_org_uuid or "")
+        new = (email, org_uuid or "")
+        if old == new:
+            return 0
+        mappings = self.load()
+        moved = 0
+        for entry in mappings.values():
+            if (entry.get("email"), entry.get("organizationUuid", "") or "") == old:
+                entry["email"], entry["organizationUuid"] = new
+                moved += 1
+        if moved:
+            self._write(mappings)
+        return moved
+
     def resolve(self, cwd: str | Path) -> tuple[str, dict] | None:
         """Return (key, entry) of the longest mapped ancestor of ``cwd``.
 

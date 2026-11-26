@@ -39,6 +39,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap.paths import get_anthropic_config_dir
@@ -137,6 +138,13 @@ def read_profile_state(name: str) -> ProfileState:
     expires_at = data.get("expires_at")
     if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
         expires_at = None
+    else:
+        # Every view turns it into a date; a value no date can hold (NaN, or
+        # one far out of range) reads as unrecorded rather than failing them.
+        try:
+            datetime.fromtimestamp(expires_at, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            expires_at = None
     org_uuid = data.get("organization_uuid")
     org_name = data.get("organization_name")
     return ProfileState(

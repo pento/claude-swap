@@ -252,13 +252,18 @@ def mark_session_stale(session_dir: Path) -> bool:
 # for the wrong reason) AND scrubbed from the session launch env with a
 # warning: `cswap run N` is an explicit request for account N, so letting an
 # exported API key silently hijack the session would defeat the command. The
-# same-account fast path (plain claude, untouched env) does not scrub.
+# same-account fast path (plain claude, untouched env) does not scrub, except
+# for ``ANTHROPIC_PROFILE``. That one makes claude (2.1.332) use an Anthropic
+# profile and not a claude.ai login, and cswap itself sets it in every
+# Anthropic-profile session (``_run_if_anthropic_profile``), so a `cswap run`
+# from inside one would otherwise launch, and probe, the profile.
 AUTH_OVERRIDE_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "ANTHROPIC_PROFILE",
 )
 
 # `claude auth status` is a local check (no API call) but spawns the full CLI.
@@ -842,8 +847,10 @@ class SessionManager:
                 share_history,
             )
             env = dict(os.environ)
-            # Run on the default login, not on the preset profile.
+            # Run on the default login, not on the preset profile, nor on the
+            # Anthropic profile a parent profile session names.
             env.pop("CLAUDE_CONFIG_DIR", None)
+            env.pop("ANTHROPIC_PROFILE", None)
             self._exec(claude_bin, claude_args, env=env)
         if config_dir_preset:
             warning(
@@ -945,7 +952,11 @@ class SessionManager:
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
-        scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
+        # ANTHROPIC_PROFILE is replaced below, not ignored.
+        scrubbed = [
+            v for v in AUTH_OVERRIDE_ENV_VARS
+            if v != "ANTHROPIC_PROFILE" and os.environ.get(v)
+        ]
         if scrubbed:
             warning(
                 f"Ignoring {', '.join(scrubbed)} for this session — it would "
@@ -976,7 +987,10 @@ class SessionManager:
         Only the onboarding keys are seeded, as ``_bootstrap`` does (Claude
         Code shows onboarding while ``theme`` or ``hasCompletedOnboarding``
         is missing); no ``oauthAccount`` and no credential. The theme comes
-        from the default profile. Keys already present are kept.
+        from the default profile. Keys already present are kept. A file that
+        exists but does not read as a JSON object is left alone: it is the
+        session's own state (projects, settings), and a claude running in
+        another terminal may be writing it.
         """
         _mkdir_private(session_dir)
         config_path = session_dir / ".claude.json"
@@ -985,9 +999,10 @@ class SessionManager:
             try:
                 loaded = json.loads(config_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-                loaded = None
-            if isinstance(loaded, dict):
-                existing = loaded
+                return
+            if not isinstance(loaded, dict):
+                return
+            existing = loaded
         if existing.get("theme") and existing.get("hasCompletedOnboarding"):
             return
         default = SessionManager._load_json_object(get_default_global_config_path())

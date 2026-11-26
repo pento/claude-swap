@@ -605,3 +605,89 @@ class TestTransferAndRemove:
         assert not session_dir.exists()
         assert cred.exists()
         assert json.loads(cred.read_text())["access_token"] == ACCESS
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups
+# ---------------------------------------------------------------------------
+
+
+class TestProfileEnvDoesNotLeak:
+    def test_probe_env_drops_anthropic_profile(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ANTHROPIC_PROFILE", "mythos")
+        assert "ANTHROPIC_PROFILE" not in session_mod._probe_env(tmp_path)
+
+    def test_oauth_session_launch_drops_anthropic_profile(
+        self, switcher, capture_exec, monkeypatch
+    ):
+        """A `cswap run N` from inside a profile session inherits
+        ANTHROPIC_PROFILE; the OAuth session must not run on the profile."""
+        _seed_oauth_slot(switcher, "1", "me@example.com")
+        session_dir = session_dir_for(switcher.backup_dir, "1", "me@example.com")
+        monkeypatch.setattr(
+            SessionManager,
+            "setup_session",
+            lambda self, identifier, share, share_history=None: (
+                session_dir, "1", "me@example.com"
+            ),
+        )
+        monkeypatch.setattr(ClaudeAccountSwitcher, "_get_current_account", lambda self: None)
+        monkeypatch.setenv("ANTHROPIC_PROFILE", "mythos")
+        with pytest.raises(_ExecCalled) as exc:
+            SessionManager(switcher).run("1", [])
+        assert "ANTHROPIC_PROFILE" not in exc.value.env
+
+
+class TestReviewFixes:
+    def test_seed_leaves_unreadable_config_alone(self, switcher, capture_exec):
+        switcher.add_profile_account("mythos", slot=6)
+        session_dir = session_dir_for(
+            switcher.backup_dir, "6", "mythos@anthropic-profile.local"
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".claude.json").write_text('{"projects": {"x": 1}')
+        with pytest.raises(_ExecCalled):
+            SessionManager(switcher).run("6", [])
+        assert (session_dir / ".claude.json").read_text() == '{"projects": {"x": 1}'
+
+    @pytest.mark.parametrize("value", [float("nan"), 1e20, -1e20])
+    def test_unrepresentable_expiry_reads_as_unrecorded(
+        self, switcher, capsys, value
+    ):
+        _write_profile(expires_at=value)
+        assert anthropic_profile.read_profile_state("mythos").expires_at is None
+        switcher.add_profile_account("mythos", slot=6)
+        row = switcher._profile_row_fields("6")
+        assert "profileTokenExpiresAt" not in row
+        switcher.list_accounts()
+        assert "signed in" in capsys.readouterr().out
+
+    def test_readd_keeps_label_and_mappings(self, switcher):
+        from claude_swap.mappings import MappingStore
+
+        switcher.add_profile_account("mythos", slot=6, email="me@mythos.example")
+        store = MappingStore(switcher.backup_dir)
+        store.set("/work/a", "me@mythos.example", "")
+        _write_profile()  # first sign-in records the organization
+        switcher.add_profile_account("mythos", slot=6)
+        record = switcher._get_sequence_data()["accounts"]["6"]
+        assert record["email"] == "me@mythos.example"
+        assert record["organizationUuid"] == "org-console"
+        entry = store.get("/work/a")
+        assert entry["email"] == "me@mythos.example"
+        assert entry["organizationUuid"] == "org-console"
+
+    def test_import_skips_a_profile_already_in_another_slot(
+        self, switcher, temp_home: Path, capsys
+    ):
+        switcher.add_profile_account("mythos", slot=6)
+        src = temp_home / "dup.json"
+        src.write_text(json.dumps({
+            "version": 1, "accounts": [{
+                "number": 7, "email": "other@anthropic-profile.local",
+                "kind": "profile", "profile": "mythos",
+            }],
+        }))
+        import_accounts(switcher, str(src))
+        assert "7" not in switcher._get_sequence_data()["accounts"]
+        assert "already slot 6" in capsys.readouterr().err
