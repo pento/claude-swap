@@ -784,6 +784,9 @@ class SessionManager:
         # — an answer of True would read as asked for).
         requested_history = share_history
         share_history = self._resolve_share_history(requested_history)
+        self._run_if_anthropic_profile(
+            identifier, claude_bin, claude_args, share, share_history
+        )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
@@ -900,6 +903,98 @@ class SessionManager:
                     "(~/.claude), not the account's own."
                 )
             )
+
+    def _run_if_anthropic_profile(
+        self,
+        identifier: str,
+        claude_bin: str,
+        claude_args: list[str],
+        share: bool,
+        share_history: bool,
+    ) -> None:
+        """Launch an Anthropic-profile slot; return for any other slot.
+
+        The slot stores no credential (see ``anthropic_profile``), so there is
+        no same-account fast path, no seeding and no validation probe: the
+        slot's session profile gets the usual sharing, then Claude Code starts
+        with ``CLAUDE_CONFIG_DIR`` on it and ``ANTHROPIC_PROFILE`` naming the
+        profile, which makes Claude Code use that profile and not a claude.ai
+        login. The auth-override variables are scrubbed as for any session.
+        """
+        from claude_swap import anthropic_profile
+
+        account_num, email, _org_uuid = self.switcher.resolve_account(identifier)
+        if self.switcher.account_kind_for(account_num) != anthropic_profile.PROFILE_KIND:
+            return
+        record = (
+            (self.switcher._get_sequence_data() or {})
+            .get("accounts", {})
+            .get(account_num)
+        )
+        name = anthropic_profile.profile_name_of(record)
+        if name is None:
+            raise SessionError(
+                f"Account-{account_num} ({email}) is an Anthropic-profile slot "
+                "with no valid profile name. Re-add it with: cswap add "
+                f"--profile NAME --slot {account_num}"
+            )
+
+        config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
+        if config_dir_preset:
+            warning(
+                f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
+                "overriding it for this launch."
+            )
+        scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
+        if scrubbed:
+            warning(
+                f"Ignoring {', '.join(scrubbed)} for this session — it would "
+                f"override the selected account inside Claude Code."
+            )
+
+        session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        self._seed_profile_session(session_dir)
+        self._sync_sharing(session_dir, share, share_history)
+
+        if not anthropic_profile.read_profile_state(name).signed_in:
+            warning(anthropic_profile.not_signed_in_notice(name))
+        print(
+            f"{accent('Launching')} Account-{account_num} ({email}) "
+            f"{muted(f'[session mode, Anthropic profile {name}]')}"
+        )
+        env = {
+            k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
+        }
+        env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        env["ANTHROPIC_PROFILE"] = name
+        self._exec(claude_bin, claude_args, env=env)
+
+    @staticmethod
+    def _seed_profile_session(session_dir: Path) -> None:
+        """Create an Anthropic-profile slot's session profile if needed.
+
+        Only the onboarding keys are seeded, as ``_bootstrap`` does (Claude
+        Code shows onboarding while ``theme`` or ``hasCompletedOnboarding``
+        is missing); no ``oauthAccount`` and no credential. The theme comes
+        from the default profile. Keys already present are kept.
+        """
+        _mkdir_private(session_dir)
+        config_path = session_dir / ".claude.json"
+        existing: dict = {}
+        if config_path.exists():
+            try:
+                loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                loaded = None
+            if isinstance(loaded, dict):
+                existing = loaded
+        if existing.get("theme") and existing.get("hasCompletedOnboarding"):
+            return
+        default = SessionManager._load_json_object(get_default_global_config_path())
+        existing["hasCompletedOnboarding"] = True
+        if not existing.get("theme"):
+            existing["theme"] = (default or {}).get("theme") or "dark"
+        atomic_write_text(config_path, json.dumps(existing, indent=2))
 
     def _resolve_share_history(self, requested: bool | None) -> bool:
         """Whether this launch shares chat history across accounts.
