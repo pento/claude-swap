@@ -414,6 +414,17 @@ cswap add-token --email user@example.com     # optional label override
 
 </details>
 
+### Add an Anthropic Console profile (run only)
+
+A keyless Console sign-in (`/login` → Anthropic Console account, no API key) is kept by Claude Code as an Anthropic profile, not a login cswap can switch to. Register it as a slot that only `cswap run` uses; it is never a switch target and never in rotation:
+
+```bash
+cswap add --profile mythos --slot 6 --alias mythos   # label defaults to mythos@anthropic-profile.local
+cswap run 6                                          # first time: /login → Anthropic Console account in that session
+```
+
+`cswap run` starts it with `ANTHROPIC_PROFILE` set in the slot's session profile, so your default login is untouched. cswap stores no credential for it: Claude Code keeps and refreshes the profile itself, and `cswap remove` never touches `~/.config/anthropic`.
+
 **Note:** Third-party providers configured through `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` are not managed or switched; those exported variables stay in effect after a switch, so unset them to use the swapped account.
 
 ## Documentation
