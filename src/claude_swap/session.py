@@ -846,11 +846,10 @@ class SessionManager:
                 session_dir_for(self.switcher.backup_dir, account_num, email),
                 share_history,
             )
-            env = dict(os.environ)
-            # Run on the default login, not on the preset profile, nor on the
-            # Anthropic profile a parent profile session names.
+            # Not on the Anthropic profile a parent profile session names.
+            env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_PROFILE"}
+            # Run on the default login, not on the preset profile.
             env.pop("CLAUDE_CONFIG_DIR", None)
-            env.pop("ANTHROPIC_PROFILE", None)
             self._exec(claude_bin, claude_args, env=env)
         if config_dir_preset:
             warning(
